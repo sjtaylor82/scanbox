@@ -1,0 +1,21 @@
+# ScanBox dependencies.
+#
+# Core - imported unconditionally; the app won't start without these.
+wxPython
+python-docx
+fpdf2
+Pillow
+
+# Optional feature dependencies - each is wrapped in a try/except import in
+# scanbox.py. The related feature becomes unavailable if missing, but all of
+# these should be installed when building a fully featured end-user bundle.
+pywin32                  # Windows scanner/WIA support.
+numpy
+opencv-python-headless   # NOT opencv-python - ScanBox never shows any cv2
+                         # GUI window, and the headless build avoids extra
+                         # Qt/GTK DLLs that PyInstaller-style builds can
+                         # trip over.
+onnxruntime              # Florence-2 local vision engine.
+tokenizers               # Florence-2 local vision engine.
+PyMuPDF                  # "fitz" import; PDF page reading.
+accessible_output2       # Screen reader output (NVDA/JAWS/System Access/SAPI).

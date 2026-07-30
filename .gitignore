@@ -1,0 +1,26 @@
+# Per-machine generated state — never commit these.
+# vision_command.txt is written at install time with absolute paths to this
+# computer's engines\vision folder; committing it would override the correct
+# auto-detected command on every other machine.
+config/vision_command.txt
+config/settings.json
+config/photo_descriptions.json
+
+# Generated / working directories
+temp/
+output/
+images/
+__pycache__/
+*.pyc
+tmp_*.pyc.*
+
+# Large downloaded model + runtime payloads
+engines/vision/*
+!engines/vision/README.txt
+engines/florence2-cache/
+engines/florence2-runtime/
+
+# Build artifacts
+build/
+dist/
+*.spec

@@ -1,0 +1,42 @@
+{
+  "name": "ScanBox local vision pack (Florence-2-base)",
+  "subdir": "florence2-base",
+  "notes": [
+    "Installed into engines\\vision\\florence2-base so it can coexist",
+    "alongside the larger Florence-2-large pack; switch between installed",
+    "sizes from the 'Photo/document model' choice at the top of Settings",
+    "> AI.",
+    "Small (~355MB total), fast, ONNX-based photo description and OCR.",
+    "Handles both general photograph descriptions and document/receipt",
+    "transcription with one model. Runs through ONNX Runtime in-process",
+    "Fixed-prompt model, not an instructable chat-style one: it always",
+    "writes a short caption or reads text in a fixed way, rather than",
+    "following detailed style instructions the way a larger model can."
+  ],
+  "files": [
+    {
+      "name": "vision_encoder_int8.onnx",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/onnx/vision_encoder_int8.onnx"
+    },
+    {
+      "name": "embed_tokens_int8.onnx",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/onnx/embed_tokens_int8.onnx"
+    },
+    {
+      "name": "encoder_model_int8.onnx",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/onnx/encoder_model_int8.onnx"
+    },
+    {
+      "name": "decoder_model_int8.onnx",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/onnx/decoder_model_int8.onnx"
+    },
+    {
+      "name": "decoder_model_merged_int8.onnx",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/onnx/decoder_model_merged_int8.onnx"
+    },
+    {
+      "name": "tokenizer.json",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/tokenizer.json"
+    }
+  ]
+}
