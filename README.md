@@ -1,40 +1,78 @@
 ScanBox
 =======
 
-ScanBox is a privacy-first scanning, recognition and image description app for Windows.
+ScanBox is a privacy-first scanning, recognition and image description app
+for Windows, with an in-progress macOS port.
 Documents, photographs, screenshots, OCR results, and AI descriptions are
 processed locally under the standard configuration rather than being sent to
 a cloud service. ScanBox may use the internet to check GitHub for application
 updates and to download optional local AI model files.
 
-Modes
------
+Tabs
+----
 
-1. Document OCR
-   - scan a page from a Windows scanner, or import an image or PDF
-   - consults local Tesseract OCR
-   - if OCR confidence is low, or the page contains handwriting, ScanBox will ask a local vision model to
-     transcribe the page
+1. Scan
+   - scan a document or photograph with a Windows scanner
+   - on Windows, use a USB camera through the separate document-camera and
+     photo-camera commands, even when no flatbed scanner is connected
+   - on macOS, scan directly from an ImageCaptureCore flatbed scanner or use a
+     supported camera through the separate camera commands
+   - document captures use local OCR and can fall back to the local vision
+     model for difficult text or handwriting
+   - photograph captures use the local vision model for description
+   - when one camera is available it is used immediately; when several are
+     available ScanBox presents a keyboard-accessible camera choice
+   - delayed capture runs quietly and can be stopped from the main window; fixed repeated
+     capture and continuous capture with a Stop Camera Capture command are
+     available
+   - FaceAlign gives local, two-second face-position guidance after the user
+     chooses a detected camera from a labelled camera list, and continues
+     until the user cancels it
 
-2. Photograph Description
-   - import or scan a photo
-   - asks a local vision model to describe the image
-   - "Use OCR for text in photographs" grounds the description with a Tesseract text draft when confidence is high enough, so names and other visible words come through more accurately
-   - descriptions can be selected and copied with standard copy commands
+2. Import
+   - import a document image, PDF, photograph, or batch of photographs
+   - OCR Document upon import enables OCR for scanned PDF conversion
+   - leave OCR Document upon import off for a selectable-text PDF when table-aware conversion
+     is preferred
 
 3. Photo Library
-   - browse previously described photos, see the stored description, and open, locate, or copy the path of the original file
+   - browse previously described photos, see the stored description, and open,
+     locate, or copy the path of the original file
 
 What you need
 -------------
 
-  Windows 10 or 11 (64-bit).
+  Windows 10 or 11 (64-bit). macOS 14 or later is currently a test preview.
 
-  Scanning uses Windows Image Acquisition (WIA), so any scanner with a Windows
-  driver works.
+  Windows scanner capture uses Windows Image Acquisition (WIA), so a scanner
+  with a WIA driver works. USB/UVC cameras use OpenCV's Windows camera backend
+  and do not need to appear as WIA scanners. Scanner and camera discovery are
+  separate, so one device type cannot take precedence over the other.
+  A front-facing camera can describe objects held in view. It can also attempt
+  document capture, although a stable USB document camera normally gives OCR a
+  clearer, more squarely positioned page.
+  Camera descriptions remain temporary until the captured images are saved;
+  only then are the saved paths and descriptions added to the Photo Library.
 
-  Tesseract OCR is bundled. The optional local vision model is downloaded on
-  demand (see below).
+  On macOS, Scan Document discovers conventional scanners through
+  ImageCaptureCore and scans from the selected flatbed directly into ScanBox.
+  Camera capture remains separate. Allow ScanBox camera access in System
+  Settings > Privacy & Security > Camera when using a camera.
+
+  Minimizing the macOS preview leaves its window in the Dock. The Windows
+  notification-area option is not shown on macOS.
+
+  The macOS test build mirrors the Windows active-window shortcuts:
+  Control+backslash describes the frontmost application's foremost window,
+  Control+Shift+backslash reads its text, Control+Shift+/ asks Qwen a question
+  about it, and Control+Option+backslash toggles ScanBox. macOS requires Screen
+  Recording permission under System Settings >
+  Privacy & Security for window capture; native shortcut registration does
+  not require Accessibility permission. Reopen ScanBox after granting Screen
+  Recording permission.
+
+  Text recognition uses Windows OCR on Windows and Apple Vision on macOS. The
+  optional local vision model is downloaded on demand (see below).
 
 Local vision model
 ------------------
@@ -42,31 +80,26 @@ Local vision model
 The local vision model is optional. ScanBox works without it, but photograph
 description and OCR rescue require it.
 
-Easiest setup: open Settings (Ctrl+Comma), go to the AI tab, and choose
-"Install or update local AI model". Pick a size when prompted (see below),
-and it downloads, unpacks, and configures everything automatically in the
-background.
+Easiest setup: open Settings (Ctrl+Comma on Windows or Command+Comma on macOS),
+go to the AI tab, choose an image-description model, then choose "Install or
+update local AI model". ScanBox downloads and configures it in the background.
 
 Recommended model (built in)
 ----------------------------
 
-  Runtime: ONNX Runtime, in-process (not a separate program)
-  Model:   Florence-2, in two sizes:
-             - Smaller/base  (~355MB) - quicker, less accurate
-             - Larger        (~1.06GB) - slower, improved accuracy
-
-  Either size handles both general photograph descriptions and document/
-  receipt transcription with the one model. It's a fixed-prompt model, not
-  an instructable chat-style one, so it always writes a short caption or
-  reads text in a fixed way rather than following custom style instructions.
-
-  Both sizes can be installed at once. Once at least one is, Settings > AI
-  shows a "Photo/document model" choice at the top of the tab (one option
-  per installed size); switching takes effect immediately, no restart
-  needed. Only one size is active at a time - there's no per-photo choice,
-  it applies to every description and transcription until changed again.
-  A "Delete selected model" button underneath removes whichever size is
-  currently selected from this computer, freeing up its disk space.
+  ScanBox includes two local choices: the smaller, quicker Florence-2 Base
+  (about 355 MB), and the larger, more accurate Qwen3-VL 2B (about 2.28 GB).
+  Settings identifies which models are
+  installed. Photo descriptions include the selected model name and
+  processing time to support fair testing.
+  Florence-2 Base remains the difficult-document transcription fallback; the
+  model choice changes image descriptions only.
+  On Windows and macOS, substantial native OCR is shown separately beneath the
+  description. It is not supplied to Qwen, so imperfect OCR cannot influence
+  the visual description.
+  On computers with at least 8 GB of memory, Qwen is loaded quietly at launch
+  and kept ready until ScanBox closes. This substantially reduces the wait for
+  later descriptions. Computers below 8 GB load it only when needed.
 
 Saving results
 --------------
@@ -78,23 +111,14 @@ imported images and PDFs are not duplicated. A single scan uses a standard
 Save As dialog; multiple scans use collision-safe numbered filenames.
 Document page headings are hidden by default and can be enabled in Settings.
 
-Higher quality option (advanced)
----------------------------------
-
-Want something even higher quality than Florence-2-large, and don't mind a
-much bigger, slower download? Copy config\vision_pack.example.json to
-config\vision_pack.json and install the local AI again. That switches to a
-different, llama.cpp-based Qwen2.5-VL-3B model (about 2.8 GB) and overrides
-the built-in Florence-2 pack entirely - the base/large size choice no longer
-applies once this override is in place.
-
 How install works
 ------------------
 
-The Install Local AI button reads config\vision_pack.json if it exists (an
-advanced override - see above), otherwise it uses the built-in Florence-2
-pack matching whichever size you chose, downloading into its own
-subdirectory under engines\vision so both sizes can coexist. For
+The Install Local AI button downloads the description model selected in Settings. Qwen3-VL
+also receives ScanBox's private local multimodal runner. Windows prefers the
+hardware-accelerated Vulkan runner and retains a CPU fallback; macOS uses the
+native runner. Users
+are not asked to configure commands or executable paths. For
 distribution you can also ship engines\vision already populated.
 
 Where your files live
@@ -109,48 +133,47 @@ that per-user state moves to:
 
   %LOCALAPPDATA%\ScanBox
 
-Bundled, read-only parts (Tesseract, the screen-reader support file, the
-PDF-to-Word engine, and any pre-shipped vision pack) always stay in the install
-folder.
+For a packaged macOS build, per-user state is stored in:
+
+  ~/Library/Application Support/ScanBox
+
+Bundled, read-only parts (the screen-reader support file, the PDF-to-Word
+engine, and any pre-shipped vision pack) always stay in the install folder.
 
 Screen reader support
 ---------------------
 
-Spoken status and results are routed to whichever Windows screen reader is
-running (NVDA, JAWS, System Access, or SAPI) through accessible_output2. If no
-screen reader is running, ScanBox stays silent. All controls are standard
-accessible Windows widgets, and the main window opens maximized by default so
-the results area has plenty of room to read.
+On Windows, spoken status and results are routed to the running screen reader
+(NVDA, JAWS, System Access, or SAPI) through accessible_output2. The macOS
+test build uses standard wxWidgets controls for navigation and native AppKit
+announcements for VoiceOver speech and braille. The main window opens maximized
+by default so the results area has plenty of room to read.
 
 PDF reading and Word
 --------------------
 
-When "Create a DOCX and open it in Microsoft Word" is selected, ScanBox samples the
-first, middle and final PDF pages. Suitable PDFs use the bundled PDF2Word
-engine. Lower-confidence PDFs are read page by page with Tesseract and the
-local document model as needed, then written to a DOCX and opened in Word.
-The setting is disabled when Microsoft Word cannot be found.
+When "Create a DOCX and open it in Microsoft Word" is selected, PDFs with
+selectable text use the bundled PDF2Word engine. Scanned PDFs are read page by
+page with Windows OCR and written to a DOCX. The setting is disabled when
+Microsoft Word cannot be found.
 
 When "Show PDF reading in ScanBox" is selected, ScanBox does not create a DOCX. Selectable
-PDF text is extracted directly; scanned pages use Tesseract or the local
-document model according to the 75% confidence threshold. The result is shown
-directly in the results area.
+PDF text is extracted directly; scanned pages use native operating-system OCR.
+The result is shown directly in the results area.
 
-See also
---------
+Model manifests
+---------------
 
-  config\vision_command.example.txt
-  config\vision_pack.example.json
   config\vision_pack_florence2_base.json
-  config\vision_pack_florence2_large.json
+  config\vision_pack_qwen3_vl_2b.json
 
 Privacy
 -------
 
 Document scanning, OCR, screen analysis, and photograph description are
-performed on this computer. The built-in vision model runs locally in-process
-through ONNX Runtime; an advanced override pack (see "Higher quality option")
-runs locally through llama.cpp.
+performed on this computer. Florence-2 runs locally in-process through ONNX
+Runtime. Windows document and screen OCR use Windows OCR. macOS document and
+screen OCR use Apple Vision.
 
 An internet connection is used in the following circumstances:
 
@@ -159,8 +182,5 @@ An internet connection is used in the following circumstances:
     enabled by default and can be disabled under Settings > General. The check
     sends standard web-request information and the installed ScanBox version;
     it does not upload documents, images, screenshots, or recognised text.
-  - Installing or updating a local AI model downloads the required model and
-    runtime files from their published sources.
-  - An advanced custom AI command can be configured to call an online service.
-    In that case, the privacy and data-retention practices of the selected
-    provider apply. Online AI processing is not enabled by default.
+  - Installing or updating a local AI model downloads the required model files
+    from their published source.

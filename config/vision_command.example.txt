@@ -1,1 +1,0 @@
-"C:\scanbox\engines\vision\llama-mtmd-cli.exe" -m "C:\scanbox\engines\vision\SmolVLM-500M-Instruct-Q8_0.gguf" --mmproj "C:\scanbox\engines\vision\mmproj-SmolVLM-500M-Instruct-f16.gguf" --threads 4 -c 4096 -n 384 --temp 0.3 --repeat-penalty 1.1 --repeat-last-n 64 --image "{image}" -p "{prompt}"

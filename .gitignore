@@ -24,3 +24,4 @@ engines/florence2-runtime/
 build/
 dist/
 *.spec
+!packaging/ScanBox-macOS.spec

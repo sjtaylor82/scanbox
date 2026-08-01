@@ -2,387 +2,205 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>ScanBox User Manual</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ScanBox Quick Start Guide</title>
 <style>
-  body {
-    font-family: Arial, Helvetica, sans-serif;
-    max-width: 780px;
-    margin: 2em auto;
-    padding: 0 1em;
-    line-height: 1.6;
-    font-size: 17px;
-    color: #111;
-    background: #fff;
-  }
+  body { font-family: Arial, Helvetica, sans-serif; max-width: 780px; margin: 2em auto; padding: 0 1em; line-height: 1.6; font-size: 17px; color: #111; background: #fff; }
   h1 { font-size: 1.8em; margin-top: 0; }
-  h2 {
-    font-size: 1.4em;
-    margin-top: 1.8em;
-    border-bottom: 2px solid #ccc;
-    padding-bottom: 0.2em;
-  }
+  h2 { font-size: 1.4em; margin-top: 1.8em; border-bottom: 2px solid #ccc; padding-bottom: 0.2em; }
   h3 { font-size: 1.15em; margin-top: 1.3em; }
   ul, ol { padding-left: 1.6em; }
   li { margin-bottom: 0.4em; }
-  code, kbd {
-    font-family: Consolas, "Courier New", monospace;
-    background: #f0f0f0;
-    padding: 0.1em 0.4em;
-    border-radius: 3px;
-  }
-  .note {
-    border-left: 4px solid #555;
-    padding: 0.6em 1em;
-    background: #f7f7f7;
-    margin: 1em 0;
-  }
-  nav ol { padding-left: 1.4em; }
+  kbd { font-family: Consolas, "Courier New", monospace; background: #f0f0f0; padding: 0.1em 0.4em; border-radius: 3px; }
   nav { margin-bottom: 2em; }
+  nav ol { padding-left: 1.4em; }
   footer { margin-top: 3em; font-size: 0.9em; color: #444; }
 </style>
 </head>
 <body>
 
-<h1>ScanBox User Manual</h1>
-
-<p>ScanBox is a scanning, document-recognition, and photograph-description
-application for Windows. It is designed for efficient use with a screen
-reader. Documents and images are processed locally on your computer; they are
-not uploaded to an external service under the standard configuration.</p>
+<h1>ScanBox Quick Start Guide</h1>
 
 <nav aria-label="Table of contents">
 <h2>Contents</h2>
 <ol>
-  <li><a href="#getting-started">Getting Started</a></li>
-  <li><a href="#document-mode">Document OCR</a></li>
-  <li><a href="#photo-mode">Photograph Description</a></li>
-  <li><a href="#library-mode">Photo Library</a></li>
-  <li><a href="#local-ai">Setting Up the Local AI Model</a></li>
-  <li><a href="#settings">Settings</a></li>
-  <li><a href="#saving">Saving Your Results</a></li>
-  <li><a href="#pdf">Reading PDF Files</a></li>
-  <li><a href="#screen-readers">Screen Reader Support</a></li>
-  <li><a href="#tips">Tips and Troubleshooting</a></li>
+  <li><a href="#what-is-scanbox">What is ScanBox?</a></li>
+  <li><a href="#first-steps">Getting Started</a></li>
+  <li><a href="#scan">Scan a Document or Photograph</a></li>
+  <li><a href="#import">Import</a></li>
+  <li><a href="#library">Use the Photo Library</a></li>
+  <li><a href="#ai">Choose a Local AI Model</a></li>
+  <li><a href="#other-apps">Describe Another Application</a></li>
+  <li><a href="#settings">Useful Settings</a></li>
+  <li><a href="#help">Help and Troubleshooting</a></li>
   <li><a href="#privacy">Privacy</a></li>
 </ol>
 </nav>
 
-<h2 id="getting-started">1. Getting Started</h2>
+<h2 id="what-is-scanbox">1. What is ScanBox?</h2>
 
-<p>When ScanBox opens, its main window is maximised to provide sufficient
-space for reviewing results. Three tabs appear near the top of the window:
-<strong>Document</strong>,
-<strong>Photo Description</strong>, and <strong>Photo Library</strong>. Use
-<kbd>Ctrl</kbd>+<kbd>Tab</kbd>, or the tab-navigation commands provided by
-your screen reader, to move between them.</p>
+<p>Do you  have a large digital library of unidentified pictures? Perhaps you have some
+contracts which have been photocopied and sent as images that your screen reader
+cannot read. Or you may have family photographs you would like to preserve,
+but do not know what they contain.</p>
 
-<p>The main results area appears below the tabs and displays recognised text
-or photograph descriptions. Commands for saving or discarding the current
-work appear beneath the results area.</p>
+<p>Enter ScanBox. It can recognise documents, describe photographs and make
+inaccessible content from other applications available to your screen reader.
+Import one picture or dozens at a time. Save useful descriptions in the Photo
+Library, turn an inaccessible PDF into readable text, or send a PDF to
+Microsoft Word on Windows.</p>
 
-<p>Press <kbd>Ctrl</kbd>+<kbd>,</kbd> (Ctrl and comma) at any time to open
-Settings.</p>
+<p>ScanBox works locally. It is useful when online AI is unavailable, if your
+screen reader does not describe images, or when your documents and photographs
+should remain on your own computer.</p>
 
-<h2 id="document-mode">2. Document OCR</h2>
+<h2 id="first-steps">2. Getting Started</h2>
 
-<p>Use this tab to convert a scanned page, an image of a document, or a PDF
-file into readable, selectable text.</p>
-
-<ul>
-  <li><strong>Scan Document</strong> &mdash; scans a page using a connected
-  Windows scanner.</li>
-  <li><strong>Import Document</strong> &mdash; opens a file-selection dialog
-  for choosing an existing image or PDF file.</li>
-</ul>
-
-<p>When a PDF is imported, ScanBox can present its recognised text directly
-in the results area. Alternatively, if Microsoft Word is installed, ScanBox
-can convert the PDF to a DOCX document and open it in Word. Choose the
-preferred behaviour under Settings &gt; General &gt;
-<strong>PDF reading destination</strong>. This option also applies to scanned
-PDF files whose pages must first be recognised with OCR.</p>
-
-<p>ScanBox first reads the page using its built-in optical character
-recognition (OCR). A clear, high-confidence result is presented immediately.
-If confidence is low, or handwriting appears to be present, ScanBox
-automatically attempts a more detailed reading with the local AI model
-described in section 5. No separate mode is required for handwritten
-documents.</p>
-
-<div class="note">
-<strong>Note:</strong> Handwriting recognition and enhanced processing of
-low-confidence document text require the local AI model. Standard document
-scanning and OCR remain available without it.
-</div>
-
-<h2 id="photo-mode">3. Photograph Description</h2>
-
-<p>Use this tab to produce a written description of a photograph.</p>
+<p>ScanBox opens at the <strong>Scan</strong> tab. Use
+<kbd>Ctrl</kbd>+<kbd>Tab</kbd> to move between its three tabs:</p>
 
 <ul>
-  <li><strong>Scan Photo</strong> &mdash; scans a photograph using a
-  connected scanner.</li>
-  <li><strong>Import Photo</strong> &mdash; opens a file-selection dialog for
-  choosing an existing photograph.</li>
+  <li><strong>Scan</strong> works with a connected scanner or camera.</li>
+  <li><strong>Import</strong> works with files already on your computer.</li>
+  <li><strong>Photo Library</strong> contains the photograph descriptions you have saved.</li>
 </ul>
 
-<p>The <strong>Use OCR for text in photographs</strong> checkbox may improve
-the reading of important visible text, such as wording on a plaque, receipt,
-or book cover. Leave this option cleared for photographs without significant
-text so that processing remains focused on the visual content.</p>
+<p>Results appear in the Results area, ready to read, select, copy or save.
+Press <kbd>F1</kbd> at any time to open this guide.</p>
 
-<p>Describing a photograph requires the local AI model to be installed (see
-section 5). If it is not installed yet, ScanBox will offer to install it the
-first time you try.</p>
+<h2 id="scan">3. Scan a Document or Photograph</h2>
 
-<h2 id="library-mode">4. Photo Library</h2>
-
-<p>The Photo Library retains completed descriptions so that a photograph does
-not need to be processed again. Select an entry to read its full description,
-or use the commands beneath the list:</p>
+<p>Use the Scan tab when you wish to digitise and have a physical photograph described, OCR a physical document,, or ensure your face is in view in before a meeting,.
+</p>
 
 <ul>
-  <li><strong>Open Photo</strong> &mdash; opens the original image file.</li>
-  <li><strong>Open Containing Folder</strong> &mdash; opens the folder the
-  photo is stored in.</li>
-  <li><strong>Copy Path</strong> &mdash; copies the photo's file location to
-  the clipboard.</li>
-  <li><strong>Remove Stored Description</strong> &mdash; deletes just the
-  saved description, not the photo itself.</li>
+  <li><strong>Scan Document</strong> reads a page from a connected scanner.</li>
+  <li><strong>OCR using Camera</strong> photographs a page and reads its text.</li>
+  <li><strong>Scan Photo</strong> scans and describes a printed photograph.</li>
+  <li><strong>Take Photo</strong> captures and describes what your camera sees.</li>
+  <li><strong>FaceAlign</strong> announces the position of your face in a front-facing camera.</li>
 </ul>
 
-<h2 id="local-ai">5. Setting Up the Local AI Model</h2>
+<p>These commands are the same on Windows and macOS. If more than one suitable
+device is connected, ScanBox asks which one to use.</p>
 
-<p>Photograph description and enhanced recognition of difficult documents
-require a local AI model. Installation is optional; standard document
-scanning remains available without it.</p>
+<h3>Camera timing</h3>
 
-<h3>Installing a model</h3>
+<p>The Camera tab within Settings contains a number of controls useful if you're attempting to line up a perfect shot. Delay before first capture gives you an opportunity to ensure everything is focused correctly before the shot is taken. You can set a delay in seconds if taking multiple pictures. Lastly, enter the value for the number of captures you would like ScanBox to take continuously, with 0 being the value for continuous capture.
+</p>
 
-<ol>
-  <li>Press <kbd>Ctrl</kbd>+<kbd>,</kbd> to open Settings.</li>
-  <li>Go to the <strong>AI</strong> tab.</li>
-  <li>Choose <strong>Install or update local AI model</strong>.</li>
-  <li>You will be asked to pick a size:
-    <ul>
-      <li><strong>Smaller</strong> &mdash; faster, with lower accuracy,
-      about 357&nbsp;MB to download.</li>
-      <li><strong>Larger</strong> &mdash; slower, with improved accuracy,
-      about 1.06&nbsp;GB to download.</li>
-    </ul>
-  </li>
-  <li>Confirm the selection. The download proceeds in the background, with
-  progress announcements provided through the active screen reader. ScanBox
-  remains available for other work during the download.</li>
-</ol>
+<h3>Using a phone</h3>
 
-<h3>Choosing between the two sizes</h3>
+<p>A phone mounted above a page can give clearer results than a laptop webcam.
+Windows 11 can use a supported Android phone as a connected camera. A Mac can
+use an iPhone through Continuity Camera. Once the phone is available as a
+camera on the computer, it will automatically appear in ScanBox.</p>
 
-<p>Both model sizes may be installed at the same time and selected as
-required:</p>
+<p>ScanBox may recognise clear handwriting, but it does not specifically detect
+handwriting and results are less reliable than printed text. There is no
+separate handwriting mode.</p>
 
-<ol>
-  <li>Press <kbd>Ctrl</kbd>+<kbd>,</kbd> to open Settings.</li>
-  <li>Go to the <strong>AI</strong> tab. At the top, above the install
-  button, is a "Photo/document model" choice with a radio button for each
-  installed size (just one button if only one size is installed, or two if
-  both are).</li>
-  <li>Select the model to use, then choose <strong>OK</strong>.</li>
-</ol>
-
-<p>The change takes effect immediately and does not require a restart. It
-applies to subsequent photograph descriptions and enhanced document
-recognition until another model is selected. If no model is installed, the
-page displays an explanatory message instead of a model choice.</p>
-
-<h3>Deleting a model</h3>
-
-<p>Underneath the model choice is a <strong>Delete selected model</strong>
-button. It removes the selected model from the computer and releases the disk
-space it occupied. Confirmation is required. The Settings dialog closes after
-the removal; reopen it to make further changes. A removed model may be
-reinstalled later by selecting <strong>Install or update local AI
-model</strong>.</p>
-
-<h3>Using an online model (advanced)</h3>
-
-<p>ScanBox can pass an image and its instructions to a separate command-line
-program. This makes it possible to use an online vision service if required.
-ScanBox does not include an online-service connector, so a small helper
-program supplied by the service provider or written for its API is required.</p>
-
-<div class="note">
-<strong>Privacy notice:</strong> An online helper may upload photographs,
-document images, screenshots, recognised text, and instructions to an
-external service. Review the provider's privacy, retention, security, and
-cost policies before proceeding. Do not place an API key directly in the
-ScanBox command. Store it securely, such as in an environment variable or the
-credential system recommended by the provider.
-</div>
-
-<p>For example, suppose a helper program named
-<code>online_vision.py</code> has been placed in
-<code>C:\ScanBox Tools</code>. Its ScanBox command might be:</p>
-
-<p><code>python "C:\ScanBox Tools\online_vision.py" --task "{task}"
---image "{image}" --prompt "{prompt}" --draft "{draft}"</code></p>
-
-<p>The helper program in this example is illustrative and is not included
-with ScanBox. It would receive the following values:</p>
+<h2 id="import">4. Import </h2>
 
 <ul>
-  <li><code>{task}</code> &mdash; either <code>describe</code> for a
-  photograph or <code>transcribe</code> for a document.</li>
-  <li><code>{image}</code> &mdash; the full path of the image to process.</li>
-  <li><code>{prompt}</code> &mdash; ScanBox's instructions for the requested
-  task.</li>
-  <li><code>{draft}</code> &mdash; the path of an optional OCR draft. This
-  value may be empty.</li>
+  <li><strong>Import Document</strong> reads and optionally converts a document image or PDF.</li>
+  <li><strong>Import Photo</strong> describes photographs and adds the descriptions to Scanbox's photo library. </li>
 </ul>
 
-<p>The helper must send the completed description or transcription to its
-standard output as plain text. It should report failures through its error
-output and return a non-zero exit status.</p>
+<p>For a PDF requiring OCR, select <strong>OCR Document upon import</strong>. Leave
+it cleared when the PDF already contains selectable text. On Windows, tables will also be preserved if the document has them.</p>
 
-<ol>
-  <li>Install and test the helper according to the provider's instructions.</li>
-  <li>If a built-in local AI model is installed, remove it under Settings
-  &gt; AI. Installed local models take precedence over a custom command.</li>
-  <li>Open Settings &gt; AI and choose
-  <strong>Set custom AI command</strong>.</li>
-  <li>Enter the command, including the required placeholders, and select
-  <strong>OK</strong>.</li>
-  <li>Test the configuration with a non-sensitive image before processing
-  private material.</li>
-</ol>
+<p>Windows uses its native OCR engine. macOS uses Apple Vision. No separate OCR
+package is required.</p>
 
-<h2 id="settings">6. Settings</h2>
+<p>When Qwen3-VL 2B is installed, <strong>Ask About Photo</strong> can answer a
+specific question about the current photograph. Its answer does not replace
+the description stored in the Photo Library.</p>
 
-<p>Settings (<kbd>Ctrl</kbd>+<kbd>,</kbd>) has two tabs:</p>
+<h2 id="library">5. Use the Photo Library</h2>
 
-<h3>General</h3>
-<ul>
-  <li><strong>Delete output files upon exit</strong> &mdash; automatically
-  removes files created in the output folder when ScanBox closes.</li>
-  <li><strong>Check for updates on startup</strong> &mdash; checks the
-  official ScanBox release page when the application starts. This option is
-  enabled by default. The startup check remains silent unless a newer version
-  is available.</li>
-  <li><strong>Keep ScanBox in the notification area when minimized</strong>
-  &mdash; allows ScanBox to remain available in the background after its main
-  window is minimized. This option is enabled by default. Closing the main
-  window still exits ScanBox.</li>
-  <li><strong>PDF reading destination</strong> &mdash; choose whether PDF
-  results appear inside ScanBox, or are converted into a Word document and
-  opened in Microsoft Word (only available if Word is installed on your
-  computer).</li>
-  <li><strong>Append text to buffer for each Scan or Import</strong> &mdash;
-  turn this on if you are working through a multi-page document and want
-  every page's text collected together instead of replacing the previous
-  page.</li>
-  <li><strong>Show document page headings in results</strong> &mdash; adds a
-  heading before each page's text when working through multiple pages.</li>
-  <li><strong>Enable diagnostic logging</strong> &mdash; keeps a log file of
-  ScanBox activity that may assist with diagnosing a problem.</li>
-</ul>
+<p>The Photo Library lets you return to a photograph without describing it
+again. Select an entry to read its description. You can open the original
+photo, open its folder, copy its file location, ask Qwen a question about it,
+or remove the stored description. Removing a description does not delete the
+photograph.</p>
 
-<h3>AI</h3>
-<p>Use this page to select an installed local AI model, remove a model,
-install or update the local AI components, or configure a custom local AI
-command. See section 5 for further information.</p>
+<h2 id="ai">6. Choose a Local AI Model</h2>
 
-<h3>Help menu</h3>
-<p>The <strong>Help</strong> menu provides access to this user manual, a
-manual update check, and the About dialog. Press <kbd>F1</kbd> to open the
-manual at any time. The About dialog displays the installed ScanBox version.</p>
-
-<h2 id="saving">7. Saving Your Results</h2>
+<p>Open Settings and choose the AI page to install or select a model:</p>
 
 <ul>
-  <li><strong>Save Text</strong> &mdash; appears once there is text to save,
-  and saves it as a plain-text file.</li>
-  <li><strong>Save Images</strong> &mdash; appears after a scan, letting you
-  keep copies of the scanned images themselves.</li>
-  <li><strong>Discard Session</strong> &mdash; clears the current results and
-  begins a new session.</li>
+  <li><strong>Florence-2 Base</strong> is smaller and quicker. It is useful for
+  browsing a collection and getting a brief description.</li>
+  <li><strong>Qwen3-VL 2B</strong> is larger and usually provides a fuller,
+  more accurate description. It also supports questions about photographs and
+  the active window.</li>
 </ul>
 
-<p>You can also select any text in the results area at any time and copy it
-with the usual copy command (<kbd>Ctrl</kbd>+<kbd>C</kbd>).</p>
+<p>Qwen is an optional download of about 2.28 GB. On computers with at least
+8 GB of memory, ScanBox can keep it ready in the background for faster later
+descriptions. Printed document OCR works without either model.</p>
 
-<h2 id="pdf">8. Reading PDF Files</h2>
+<h2 id="other-apps">7. Describe Another Application</h2>
 
-<p>Import a PDF from the Document tab. What happens next depends on the PDF
-destination setting described above:</p>
+<p>ScanBox can remain in the background while you use Safari, Mail, a web
+browser or another application. Bring the required window to the foreground,
+then use:</p>
 
 <ul>
-  <li><strong>Show PDF reading in ScanBox</strong> &mdash; the text appears
-  directly in the results area. Selectable text already in the PDF is used
-  as-is; scanned pages are read with OCR or the local AI model as needed.</li>
-  <li><strong>Create a DOCX and open it in Microsoft Word</strong> &mdash;
-  ScanBox converts the PDF into a Word document and opens it for you. This
-  option only appears if Microsoft Word is installed.</li>
+  <li><kbd>Ctrl</kbd>+<kbd>\</kbd> to describe the active window.</li>
+  <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>\</kbd> to read its text.</li>
+  <li><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>/</kbd> to ask Qwen a question about it.</li>
 </ul>
 
-<h2 id="screen-readers">9. Screen Reader Support</h2>
+<p>The shortcuts use the Control key on both Windows and macOS. On macOS,
+allow ScanBox to record the screen when the system first asks. Only the active
+window is captured.</p>
 
-<p>ScanBox announces status information and results through a supported
-screen reader, including NVDA, JAWS, System Access, and Windows
-Narrator/SAPI. No additional configuration is required. When no supported
-screen reader is active, ScanBox operates visually without speech output.</p>
+<p>Use <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>\</kbd> on Windows, or
+<kbd>Control</kbd>+<kbd>Option</kbd>+<kbd>\</kbd> on macOS, to hide or restore
+ScanBox.</p>
 
-<p>Buttons, checkboxes, lists, and other interactive elements use standard
-accessible Windows controls. The main window opens maximised by default to
-provide ample space for reviewing results.</p>
+<h2 id="settings">8. Useful Settings</h2>
 
-<h3>Describing or reading the active window</h3>
-<ul>
-  <li>Press <kbd>Ctrl</kbd>+<kbd>\</kbd> to describe the meaningful visual
-  content of the active window.</li>
-  <li>Press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>\</kbd> to recognise text
-  displayed in the active window.</li>
-  <li>Press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>\</kbd> to toggle the ScanBox
-  window. When ScanBox is the active window, the shortcut minimizes it to the
-  notification area. When ScanBox is hidden, minimized, or behind another
-  application, the shortcut restores it and returns keyboard focus to it.</li>
-</ul>
-<p>Keep the required application in the foreground when using either
-shortcut. ScanBox analyses the pixels currently visible within that window;
-content hidden behind another window or outside the visible area cannot be
-included.</p>
-
-<h2 id="tips">10. Tips and Troubleshooting</h2>
+<p>Open Settings with <kbd>Ctrl</kbd>+<kbd>,</kbd> on Windows or
+<kbd>Command</kbd>+<kbd>,</kbd> on macOS. Settings include:</p>
 
 <ul>
-  <li><strong>ScanBox remembers the last folder you imported from</strong>,
-  so you do not need to navigate back to it every time.</li>
-  <li><strong>Photograph descriptions may take additional time</strong>
-  during the first use after installing or changing a model, because the
-  model must be loaded into memory. Subsequent descriptions are generally
-  faster.</li>
-  <li><strong>If a photograph description appears inaccurate</strong>,
-  enable <strong>Use OCR for text in photographs</strong> when the image
-  contains important text, or select the larger model under Settings &gt; AI
-  for improved accuracy.</li>
-  <li><strong>If the local AI features are unavailable</strong>, check
-  Settings &gt; AI to make sure a model has been installed.</li>
+  <li>collecting several scanned pages in one result;</li>
+  <li>opening PDF results in Microsoft Word on Windows;</li>
+  <li>camera delays and repeated captures;</li>
+  <li>installing and choosing an AI model;</li>
+  <li>checking for updates; and</li>
+  <li>removing temporary output when ScanBox closes.</li>
 </ul>
 
-<h2 id="privacy">11. Privacy</h2>
+<h2 id="help">9. Help and Troubleshooting</h2>
 
-<p>Document scanning, text recognition, screen analysis, and photograph
-description are performed locally on your computer. Documents, screenshots,
-and photographs are not uploaded under the standard configuration.</p>
+<p>The Help menu contains this guide, Check for Updates, Donate to Project,
+license information and About ScanBox.</p>
 
-<p>An internet connection is used when downloading local AI model files and
-when checking GitHub for a newer ScanBox release. The startup update check may
-be disabled under Settings &gt; General. Advanced users may configure a
-different AI command, including one that communicates with an external
-service; such a configuration is not enabled by default.</p>
+<ul>
+  <li>If a scanned PDF contains no readable text, select
+  <strong>OCR Document upon import</strong> and import it again.</li>
+  <li>If camera text is unclear, keep the page steady, fill the picture with
+  the page and reduce glare.</li>
+  <li>If an AI feature is unavailable, open the AI page in Settings and check
+  that the required model is installed.</li>
+  <li>If macOS screen shortcuts do not work, allow ScanBox under System
+  Settings, Privacy &amp; Security, Screen Recording, then reopen ScanBox.</li>
+</ul>
+
+<h2 id="privacy">10. Privacy</h2>
+
+<p>Document recognition, screen analysis and photograph descriptions are
+performed on your computer. ScanBox does not upload your documents or images.
+An internet connection is used only to download an AI model, check for updates
+or open a link you choose from the Help menu.</p>
 
 <footer>
-<p>ScanBox &mdash; a privacy-first scanning, recognition, and photo
-description program for Windows.</p>
+<p>ScanBox &mdash; local scanning, recognition and photograph description for
+Windows and macOS.</p>
 </footer>
 
 </body>

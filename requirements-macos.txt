@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Build dependency for creating ScanBox.app from packaging/ScanBox-macOS.spec.
+pyinstaller
