@@ -1,4 +1,20 @@
--r requirements.txt
+# Runtime used by the macOS application. Camera capture, FaceAlign, PDF text
+# extraction and OCR are supplied by the native Apple-framework helper, so the
+# Mac build deliberately does not install OpenCV or PyMuPDF.
+wxPython
+python-docx
+fpdf2
+Pillow
+numpy
+coloredlogs
+flatbuffers
+packaging
+protobuf
 
-# Build dependency for creating ScanBox.app from packaging/ScanBox-macOS.spec.
+# Calls AppKit directly, at startup only, to force ScanBox to become the
+# active application - see _macos_activate_self in scanbox.py.
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+
+# Build dependency for creating ScanBox.app.
 pyinstaller

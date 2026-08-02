@@ -54,7 +54,7 @@ What you need
   Camera descriptions remain temporary until the captured images are saved;
   only then are the saved paths and descriptions added to the Photo Library.
 
-  On macOS, Scan Document discovers conventional scanners through
+  On macOS, Scan and Read Document and Scan and Save Images discover conventional scanners through
   ImageCaptureCore and scans from the selected flatbed directly into ScanBox.
   Camera capture remains separate. Allow ScanBox camera access in System
   Settings > Privacy & Security > Camera when using a camera.
@@ -106,10 +106,14 @@ Saving results
 
 Document results can be selected and copied at any time. Save Text is shown
 only when "Append text to buffer for each Scan or Import" is enabled for a
-multi-page session. Save Scanned Images is shown only for scanner captures;
-imported images and PDFs are not duplicated. A single scan uses a standard
-Save As dialog; multiple scans use collision-safe numbered filenames.
-Document page headings are hidden by default and can be enabled in Settings.
+multi-page session. Scan and Read Document does not offer image export.
+Use Scan and Save Images for a separate, non-reading workflow that saves one
+page as JPEG or collects multiple pages into one PDF. ScanBox quietly tests
+four physical rotations with native OCR and deterministic scoring, then
+reports whether each page is upright, needs rotation, or could not be
+determined. It offers to rotate the whole page before export when appropriate.
+Imported images and PDFs are not duplicated. Document page headings are hidden
+by default and can be enabled in Settings.
 
 How install works
 ------------------

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -27,7 +28,10 @@ else:
     winreg = None
 
 import docx
-from pdf_to_word import pdf_to_docx
+if sys.platform == "win32":
+    from pdf_to_word import pdf_to_docx
+else:
+    pdf_to_docx = None
 import wx
 import wx.adv
 from fpdf import FPDF
@@ -156,7 +160,10 @@ IMAGES_DIR = os.path.join(DATA_DIR, "images")
 OUTPUT_DIR = os.path.join(DATA_DIR, "output")
 CONFIG_DIR = os.path.join(DATA_DIR, "config")
 APP_SETTINGS_CONFIG = os.path.join(CONFIG_DIR, "settings.json")
-LOG_FILE = os.path.join(OUTPUT_DIR, "scanbox.log")
+LOG_FILE = os.environ.get(
+    "SCANBOX_LOG_FILE",
+    os.path.join(OUTPUT_DIR, "scanbox.log"),
+)
 PHOTO_LIBRARY_MANIFEST = os.path.join(CONFIG_DIR, "photo_descriptions.json")
 VISION_DIR = os.path.join(DATA_DIR, "engines", "vision")
 BUNDLED_VISION_DIR = os.path.join(RESOURCE_BASE, "engines", "vision")
@@ -169,6 +176,7 @@ VISION_MODELS = {
         "choice_label": "Smaller model — Florence-2 Base",
         "subdir": FLORENCE_SUBDIR,
         "manifest": FLORENCE_MANIFEST_FILENAME,
+        "mac_manifest": "vision_pack_florence2_base_macos.json",
         "runner": "florence",
     },
     "qwen3_vl_2b": {
@@ -179,6 +187,20 @@ VISION_MODELS = {
         "runner": "mtmd",
     },
 }
+if sys.platform == "darwin":
+    # Every community-published Florence-2 ONNX decoder export tried for
+    # macOS has failed differently: INT8 needs the ConvInteger op, which
+    # has no kernel in ONNX Runtime's Apple Silicon CPU provider; the FP16
+    # decoder_with_past and decoder_model_merged exports each load (or in
+    # the merged case, fail to load - a malformed subgraph) but are
+    # statically shaped in ways incompatible with plain one-token
+    # generation. Without a working cached decoder, quality and speed both
+    # trail Windows significantly even before those export bugs. Qwen3-VL
+    # 2B already works reliably on macOS, so it is the only local AI model
+    # offered there rather than continuing to ship a degraded Florence-2
+    # Base experience.
+    del VISION_MODELS["florence_base"]
+DEFAULT_VISION_MODEL_ID = "qwen3_vl_2b" if sys.platform == "darwin" else "florence_base"
 DEFAULT_APP_SETTINGS = {
     "delete_output_files_on_exit": False,
     "check_for_updates_on_startup": True,
@@ -200,7 +222,8 @@ DEFAULT_APP_SETTINGS = {
     "camera_interval_seconds": 5,
     # Zero means repeat until the user chooses Stop Camera Capture.
     "camera_capture_count": 1,
-    "vision_model": "florence_base",
+    "vision_model": DEFAULT_VISION_MODEL_ID,
+    "mac_permissions_prompted": False,
 }
 
 # Leave processor capacity for the desktop and screen reader while giving the
@@ -211,6 +234,27 @@ VISION_THREADS = min(6, max(2, (os.cpu_count() or 4) // 2))
 MTMD_IMAGE_TOKENS = 1024
 MTMD_TIMEOUT_SECONDS = 180
 QWEN_PRELOAD_MINIMUM_RAM = 8 * 1024**3
+
+# Set once a GPU run has failed with a Metal "out of memory" error
+# (kIOGPUCommandBufferCallbackErrorOutOfMemory). That error means the Mac's
+# GPU genuinely doesn't have enough memory available for a fully
+# GPU-offloaded run right now, not that anything is misconfigured, so once
+# seen this process falls back to CPU-only inference (-ngl 0) for the rest
+# of the session rather than repeating the same failed attempt on every
+# photo.
+_mtmd_gpu_out_of_memory = False
+
+_MTMD_GPU_OOM_MARKERS = (
+    "kIOGPUCommandBufferCallbackErrorOutOfMemory",
+    "Insufficient Memory",
+)
+
+
+def _mtmd_diagnostics_show_gpu_oom(diagnostics):
+    return diagnostics and any(
+        marker in diagnostics for marker in _MTMD_GPU_OOM_MARKERS
+    )
+
 
 _mtmd_server_lock = threading.Lock()
 _mtmd_server_process = None
@@ -248,6 +292,21 @@ try:
 except ImportError:
     win32com = None
 
+try:
+    # PyObjC, used only for a single, non-interactive call at startup:
+    # forcing ScanBox to become the frontmost/active application. This is
+    # a different situation from the macOS Import picker, where PyObjC
+    # turned out not to help - that needed genuine keyboard-event
+    # interaction with a panel, which wx's ownership of the process's one
+    # NSApplication/event loop blocked no matter which API built the
+    # panel. Activating the app is a single fire-and-forget request with
+    # no follow-up keyboard interaction, so there's nothing for wx's event
+    # loop to interfere with here.
+    from AppKit import NSApplicationActivateIgnoringOtherApps, NSRunningApplication
+except ImportError:
+    NSRunningApplication = None
+    NSApplicationActivateIgnoringOtherApps = None
+
 # Windows GUI builds suppress child-process consoles.
 if sys.platform == "win32":
     NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -267,13 +326,22 @@ def _make_speaker():
     back to the bundled NVDA controller DLL, then to a silent no-op."""
     if sys.platform == "darwin":
         def speak_with_voiceover(text):
-            process = _mac_announce_process
-            if process is None or process.stdin is None or process.poll() is not None:
-                return
-            encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
-            with _mac_announce_lock:
-                process.stdin.write(f"announce\t{encoded}\n")
-                process.stdin.flush()
+            # This is the same public VoiceOver ``output`` Apple event used
+            # by accessible_output2. Unlike an accessibility notification
+            # from a background helper, VoiceOver treats it as speech.
+            script = (
+                'on run argv\n'
+                'tell application "VoiceOver" to output item 1 of argv\n'
+                'end run'
+            )
+            try:
+                subprocess.Popen(
+                    ["osascript", "-e", script, text],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                logger.exception("Could not send a VoiceOver announcement")
 
         return speak_with_voiceover
     try:
@@ -420,6 +488,42 @@ def reveal_in_file_manager(path):
     open_with_default_application(os.path.dirname(path))
 
 
+def open_macos_privacy_pane(anchor):
+    """Open a macOS Privacy & Security pane."""
+    url = f"x-apple.systempreferences:com.apple.preference.security?{anchor}"
+    try:
+        subprocess.Popen(
+            ["open", "-b", "com.apple.systempreferences", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        subprocess.Popen(
+            ["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    subprocess.Popen(
+        ["open", "-a", "System Settings"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def reset_macos_scanbox_permissions():
+    """Reset this app's user-level TCC entries so macOS will prompt again."""
+    bundle_id = "au.com.scanbox.ScanBox"
+    result = subprocess.run(
+        ["tccutil", "reset", "All", bundle_id],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(detail or "tccutil reset failed.")
+
+
 def read_app_settings():
     """Load settings.json, coercing each value to match its default's type
     (bool defaults stay bool, string defaults stay string, etc). Earlier this
@@ -451,7 +555,7 @@ def read_app_settings():
     if settings["vision_model"] == "qwen2_vl_2b":
         settings["vision_model"] = "qwen3_vl_2b"
     elif settings["vision_model"] not in VISION_MODELS:
-        settings["vision_model"] = "florence_base"
+        settings["vision_model"] = DEFAULT_VISION_MODEL_ID
     return settings
 
 
@@ -705,9 +809,15 @@ _FLORENCE_FILE_PATTERNS = {
     "embed_tokens": lambda n: n.startswith("embed_tokens") and n.endswith(".onnx"),
     "encoder_model": lambda n: n.startswith("encoder_model") and n.endswith(".onnx"),
     "decoder_model": lambda n: (
-        n.startswith("decoder_model") and "merged" not in n and n.endswith(".onnx")
+        n.startswith("decoder_model")
+        and "merged" not in n
+        and "with_past" not in n
+        and n.endswith(".onnx")
     ),
     "decoder_model_merged": lambda n: n.startswith("decoder_model_merged") and n.endswith(".onnx"),
+    "decoder_with_past_model": lambda n: (
+        n.startswith("decoder_with_past_model") and n.endswith(".onnx")
+    ),
     "tokenizer": lambda n: n == "tokenizer.json",
 }
 
@@ -718,7 +828,7 @@ def _find_florence_files_in(dirpath):
     folder). Returns a dict of paths, or None if anything is missing."""
     if not os.path.isdir(dirpath):
         return None
-    found = {}
+    candidates = {key: [] for key in _FLORENCE_FILE_PATTERNS}
     try:
         names = os.listdir(dirpath)
     except OSError:
@@ -729,9 +839,38 @@ def _find_florence_files_in(dirpath):
             continue
         low = name.lower()
         for key, predicate in _FLORENCE_FILE_PATTERNS.items():
-            if key not in found and predicate(low):
-                found[key] = full
-    if len(found) != len(_FLORENCE_FILE_PATTERNS):
+            if predicate(low):
+                candidates[key].append(full)
+    # INT8-quantized conv layers use the ConvInteger op, which has no kernel
+    # in ONNX Runtime's Apple Silicon CPU provider (NOT_IMPLEMENTED at
+    # session-creation time) - so macOS cannot use the same INT8 pack
+    # Windows does. It prefers FP16 instead: full float math, no quantized
+    # ops, so it loads correctly and stays much closer to full quality than
+    # INT8 or the original Q4F16 pack. This also means a folder that still
+    # has files left over from an earlier attempt (Q4F16, or the INT8 pack
+    # that downloaded fine but failed to load) won't get picked by mistake -
+    # each platform only prefers its own working suffix; the sorted(paths)[0]
+    # fallback below only kicks in when nothing matching is present at all.
+    preferred_suffix = "_fp16.onnx" if sys.platform == "darwin" else "_int8.onnx"
+    found = {}
+    for key, paths in candidates.items():
+        if not paths:
+            continue
+        preferred = [path for path in paths if path.lower().endswith(preferred_suffix)]
+        found[key] = preferred[0] if preferred else sorted(paths)[0]
+    required = {
+        "vision_encoder", "embed_tokens", "encoder_model", "decoder_model", "tokenizer"
+    }
+    # decoder_model_merged_*.onnx (the community pack's single graph that
+    # switches between first-pass and cached decoding via a use_cache_branch
+    # flag) cannot be loaded by ONNX Runtime on Apple Silicon - it appears to
+    # be exported with a fixed token count for browser/WebGPU use. macOS
+    # instead requires the ordinary first-pass decoder and looks for the
+    # separate decoder_with_past_model_*.onnx graph (a plain, dynamically
+    # shaped cached decoder) as an optional speed upgrade; see
+    # _get_florence_engine and run_florence_task below.
+    has_decoder = "decoder_model" in found if sys.platform == "darwin" else "decoder_model_merged" in found
+    if not required.issubset(found) or not has_decoder:
         return None
     return found
 
@@ -802,11 +941,40 @@ def _get_florence_engine():
                 session_options = ort.SessionOptions()
                 session_options.intra_op_num_threads = VISION_THREADS
                 providers = ["CPUExecutionProvider"]
+                required_keys = (
+                    "vision_encoder", "embed_tokens", "encoder_model", "decoder_model"
+                )
                 sessions = {
-                    key: ort.InferenceSession(path, sess_options=session_options, providers=providers)
-                    for key, path in files.items()
-                    if key != "tokenizer"
+                    key: ort.InferenceSession(
+                        files[key], sess_options=session_options, providers=providers
+                    )
+                    for key in required_keys
                 }
+                # decoder_model_merged / decoder_with_past_model are an
+                # optional speed upgrade only (real KV-cache decoding
+                # instead of replaying the whole sequence every token).
+                # Different community-published quantizations of these
+                # graphs have turned out to have real, platform-specific
+                # problems - a missing ONNX Runtime kernel on Apple Silicon
+                # for one quantization, a statically-shaped export unusable
+                # for one-token generation for another - so each is loaded
+                # in its own try/except: a broken cache-decoder file
+                # degrades to the slower but always-correct fallback in
+                # run_florence_task instead of disabling local AI entirely.
+                for key in ("decoder_model_merged", "decoder_with_past_model"):
+                    path = files.get(key)
+                    if not path:
+                        continue
+                    try:
+                        sessions[key] = ort.InferenceSession(
+                            path, sess_options=session_options, providers=providers
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not load Florence-2 cached decoder %s; "
+                            "falling back to the slower per-token decoder.",
+                            key,
+                        )
                 tokenizer = _HFTokenizer.from_file(files["tokenizer"])
                 engine = {"sessions": sessions, "tokenizer": tokenizer}
             except Exception:
@@ -819,6 +987,25 @@ def _get_florence_engine():
 
 def florence_ready():
     return _get_florence_engine() is not None
+
+
+_ONNX_TYPE_TO_NUMPY = {
+    "tensor(float)": np.float32 if np is not None else None,
+    "tensor(float16)": np.float16 if np is not None else None,
+    "tensor(double)": np.float64 if np is not None else None,
+}
+
+
+def _onnx_session_input_dtype(session, input_name, default):
+    """Look up the numpy dtype an ONNX Runtime session actually expects for
+    a given input. The FP16 Florence-2 pack ScanBox downloads on macOS may
+    or may not keep pixel_values as float32 at the graph boundary (exports
+    vary); reading it from the session avoids a second guess-and-fail
+    round-trip like the one that hit ConvInteger on the INT8 pack."""
+    for node in session.get_inputs():
+        if node.name == input_name:
+            return _ONNX_TYPE_TO_NUMPY.get(node.type, default)
+    return default
 
 
 def _florence_preprocess_image(image_path):
@@ -850,6 +1037,11 @@ def run_florence_task(task, image_path, cancel_event=None):
         if cancel_event is not None and cancel_event.is_set():
             return PHOTO_DESCRIPTION_CANCELLED
         pixel_values = _florence_preprocess_image(image_path)
+        vision_input_dtype = _onnx_session_input_dtype(
+            sessions["vision_encoder"], "pixel_values", pixel_values.dtype
+        )
+        if pixel_values.dtype != vision_input_dtype:
+            pixel_values = pixel_values.astype(vision_input_dtype)
         input_ids = np.array([tokenizer.encode(prompt_text).ids], dtype=np.int64)
 
         image_features = sessions["vision_encoder"].run(None, {"pixel_values": pixel_values})[0]
@@ -883,14 +1075,32 @@ def run_florence_task(task, image_path, cancel_event=None):
         encoder_kv = decoder_outs[1:]
         # 4 tensors per layer (decoder key/value, encoder key/value).
         num_layers = len(encoder_kv) // 4
+        decoder_kv = []
+        for layer in range(num_layers):
+            decoder_kv.extend(encoder_kv[layer * 4 : layer * 4 + 2])
 
         generated_tokens = []
         max_new_tokens = 256 if task == "describe" else FLORENCE_MAX_NEW_TOKENS
+        # Prefer whichever cached decoder the installed pack actually has,
+        # rather than branching on platform. decoder_model_merged (Windows
+        # pack) combines the first-pass and cached-pass graphs behind a
+        # use_cache_branch switch; decoder_with_past_model (Mac pack, also
+        # usable anywhere) is a plain graph dedicated to the cached pass and
+        # needs no such switch. Both give real KV-cache decoding, unlike the
+        # "replay the whole sequence every token" fallback used only when
+        # neither is present (e.g. an older Q4F16-only Mac install that has
+        # not been re-downloaded yet).
+        if "decoder_model_merged" in sessions:
+            cached_decoder_key = "decoder_model_merged"
+        elif "decoder_with_past_model" in sessions:
+            cached_decoder_key = "decoder_with_past_model"
+        else:
+            cached_decoder_key = None
+        decoder_input_embeds = inputs_embeds[:, -1:]
         for _ in range(max_new_tokens):
             if cancel_event is not None and cancel_event.is_set():
                 return PHOTO_DESCRIPTION_CANCELLED
             logits = decoder_outs[0]
-            decoder_kv = decoder_outs[1:]
             next_token = _pick_next_token_no_repeat(
                 logits[:, -1, :], generated_tokens, FLORENCE_NO_REPEAT_NGRAM_SIZE
             )
@@ -901,20 +1111,65 @@ def run_florence_task(task, image_path, cancel_event=None):
             next_embeds = sessions["embed_tokens"].run(
                 None, {"input_ids": np.array([[next_token]], dtype=np.int64)}
             )[0]
+            # Kept up to date every iteration (cheap - one concat) even
+            # while a cached decoder is in use, so the slow fallback below
+            # always has the full sequence ready if the cached decoder
+            # fails partway through a generation.
+            decoder_input_embeds = np.concatenate(
+                [decoder_input_embeds, next_embeds], axis=1
+            )
 
-            feed = {
-                "use_cache_branch": np.array([True], dtype=np.bool_),
-                "inputs_embeds": next_embeds,
-                "encoder_hidden_states": encoder_hidden_states,
-                "encoder_attention_mask": attention_mask,
-            }
-            for layer in range(num_layers):
-                base = layer * 4
-                feed[f"past_key_values.{layer}.decoder.key"] = decoder_kv[base]
-                feed[f"past_key_values.{layer}.decoder.value"] = decoder_kv[base + 1]
-                feed[f"past_key_values.{layer}.encoder.key"] = encoder_kv[base + 2]
-                feed[f"past_key_values.{layer}.encoder.value"] = encoder_kv[base + 3]
-            decoder_outs = sessions["decoder_model_merged"].run(None, feed)
+            if cached_decoder_key is not None:
+                feed = {
+                    "inputs_embeds": next_embeds,
+                    "encoder_hidden_states": encoder_hidden_states,
+                    "encoder_attention_mask": attention_mask,
+                }
+                if cached_decoder_key == "decoder_model_merged":
+                    feed["use_cache_branch"] = np.array([True], dtype=np.bool_)
+                for layer in range(num_layers):
+                    decoder_base = layer * 2
+                    encoder_base = layer * 4
+                    feed[f"past_key_values.{layer}.decoder.key"] = decoder_kv[decoder_base]
+                    feed[f"past_key_values.{layer}.decoder.value"] = decoder_kv[decoder_base + 1]
+                    feed[f"past_key_values.{layer}.encoder.key"] = encoder_kv[encoder_base + 2]
+                    feed[f"past_key_values.{layer}.encoder.value"] = encoder_kv[encoder_base + 3]
+                try:
+                    decoder_outs = sessions[cached_decoder_key].run(None, feed)
+                except Exception:
+                    # A cached-decoder ONNX export that loads fine can still
+                    # turn out to be unusable for this shape/pattern at run
+                    # time (this is exactly what happened with the
+                    # statically-shaped decoder_with_past_model export).
+                    # Disable it for the rest of this description and fall
+                    # through to the slow-but-correct path below for the
+                    # current token too, rather than failing the whole
+                    # request.
+                    logger.exception(
+                        "Florence cached decoder %s failed at run time; "
+                        "falling back to the slower per-token decoder for "
+                        "the rest of this description.",
+                        cached_decoder_key,
+                    )
+                    cached_decoder_key = None
+                else:
+                    returned_kv = decoder_outs[1:]
+                    if len(returned_kv) == num_layers * 2:
+                        decoder_kv = returned_kv
+                    else:
+                        decoder_kv = []
+                        for layer in range(num_layers):
+                            decoder_kv.extend(returned_kv[layer * 4 : layer * 4 + 2])
+                    continue
+
+            decoder_outs = sessions["decoder_model"].run(
+                None,
+                {
+                    "inputs_embeds": decoder_input_embeds,
+                    "encoder_hidden_states": encoder_hidden_states,
+                    "encoder_attention_mask": attention_mask,
+                },
+            )
 
         text = tokenizer.decode(generated_tokens, skip_special_tokens=False)
         text = text.replace("<s>", "").replace("</s>", "").strip()
@@ -937,8 +1192,8 @@ def run_florence_task(task, image_path, cancel_event=None):
 def vision_ready(task="describe"):
     if task != "describe":
         return florence_ready()
-    model_id = read_app_settings().get("vision_model", "florence_base")
-    model = VISION_MODELS.get(model_id, VISION_MODELS["florence_base"])
+    model_id = read_app_settings().get("vision_model", DEFAULT_VISION_MODEL_ID)
+    model = VISION_MODELS.get(model_id, VISION_MODELS[DEFAULT_VISION_MODEL_ID])
     if model["runner"] == "florence":
         return florence_ready()
     return _find_mtmd_model_files(model_id) is not None and _find_mtmd_runner() is not None
@@ -1112,10 +1367,16 @@ def stop_mtmd_server():
         loading.set()
     if process is not None and process.poll() is None:
         try:
-            process.terminate()
+            logger.info("Stopping persistent local image-model service pid=%s", process.pid)
+            if sys.platform == "win32":
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=5)
         except Exception:
             try:
+                if sys.platform != "win32":
+                    os.killpg(process.pid, signal.SIGKILL)
                 process.kill()
             except Exception:
                 pass
@@ -1156,7 +1417,9 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    accelerated = "vulkan" in runner.lower() or sys.platform == "darwin"
+    accelerated = (
+        "vulkan" in runner.lower() or sys.platform == "darwin"
+    ) and not _mtmd_gpu_out_of_memory
     command = [
         server, "-m", files[0], "--mmproj", files[1],
         "--host", "127.0.0.1", "--port", str(port), "--no-webui",
@@ -1171,6 +1434,7 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
         process = subprocess.Popen(
             command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=creationflags,
+            start_new_session=sys.platform != "win32",
         )
         job = _bind_process_lifetime_to_scanbox(process)
         with _mtmd_server_lock:
@@ -1393,6 +1657,7 @@ def run_mtmd_task(
     task, image_path, model_id, prompt_override=None, max_tokens=512,
     cancel_event=None,
 ):
+    global _mtmd_gpu_out_of_memory
     runners = _find_mtmd_runners()
     files = _find_mtmd_model_files(model_id)
     if not runners or not files:
@@ -1416,8 +1681,8 @@ def run_mtmd_task(
             logger.info("Persistent local multimodal service used")
 
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    for runner in runners if not text else ():
-        accelerated = "vulkan" in runner.lower() or sys.platform == "darwin"
+
+    def run_once(runner, accelerated):
         command = [
             runner, "-m", files[0], "--mmproj", files[1], "--image", image_path,
             "-p", prompt, "-n", str(max_tokens), "--temp", "0",
@@ -1427,34 +1692,40 @@ def run_mtmd_task(
             "--image-min-tokens", str(MTMD_IMAGE_TOKENS),
             "--image-max-tokens", str(MTMD_IMAGE_TOKENS),
         ]
-        try:
-            process = subprocess.Popen(
-                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace",
-                creationflags=creationflags,
-            )
-            started = time.monotonic()
-            while True:
-                if cancel_event is not None and cancel_event.is_set():
-                    process.terminate()
-                    try:
-                        process.communicate(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.communicate()
-                    return PHOTO_DESCRIPTION_CANCELLED
-                if time.monotonic() - started >= MTMD_TIMEOUT_SECONDS:
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=creationflags,
+        )
+        started = time.monotonic()
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                process.terminate()
+                try:
+                    process.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
                     process.kill()
                     process.communicate()
-                    raise subprocess.TimeoutExpired(command, MTMD_TIMEOUT_SECONDS)
-                try:
-                    stdout, stderr = process.communicate(timeout=0.2)
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
-            result = subprocess.CompletedProcess(
-                command, process.returncode, stdout, stderr
-            )
+                return None, True
+            if time.monotonic() - started >= MTMD_TIMEOUT_SECONDS:
+                process.kill()
+                process.communicate()
+                raise subprocess.TimeoutExpired(command, MTMD_TIMEOUT_SECONDS)
+            try:
+                stdout, stderr = process.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr), False
+
+    for runner in runners if not text else ():
+        accelerated = (
+            "vulkan" in runner.lower() or sys.platform == "darwin"
+        ) and not _mtmd_gpu_out_of_memory
+        try:
+            result, cancelled = run_once(runner, accelerated)
+            if cancelled:
+                return PHOTO_DESCRIPTION_CANCELLED
         except subprocess.TimeoutExpired:
             logger.exception("Local multimodal runner timed out: %s", runner)
             failures.append("Image description took too long.")
@@ -1463,9 +1734,34 @@ def run_mtmd_task(
             logger.exception("Local multimodal inference failed: %s", runner)
             failures.append(str(exc))
             continue
-        text = (result.stdout or "").strip()
         if result.stderr:
             logger.debug("Local multimodal runner diagnostics (%s):\n%s", runner, result.stderr.strip())
+        # The GPU genuinely running out of memory (as opposed to a real
+        # configuration problem) is worth one automatic CPU-only retry
+        # rather than surfacing raw diagnostic text as the photo's
+        # "description". Remember it process-wide so later photos and the
+        # persistent server skip straight to CPU instead of repeating the
+        # same failed GPU attempt each time.
+        if accelerated and result.returncode != 0 and _mtmd_diagnostics_show_gpu_oom(result.stderr):
+            _mtmd_gpu_out_of_memory = True
+            logger.warning(
+                "GPU ran out of memory running %s; retrying on CPU.", runner
+            )
+            try:
+                result, cancelled = run_once(runner, False)
+                if cancelled:
+                    return PHOTO_DESCRIPTION_CANCELLED
+            except subprocess.TimeoutExpired:
+                logger.exception("Local multimodal runner timed out: %s", runner)
+                failures.append("Image description took too long.")
+                continue
+            except Exception as exc:
+                logger.exception("Local multimodal inference failed: %s", runner)
+                failures.append(str(exc))
+                continue
+            if result.stderr:
+                logger.debug("Local multimodal runner diagnostics (%s, CPU retry):\n%s", runner, result.stderr.strip())
+        text = (result.stdout or "").strip()
         if result.returncode == 0 and text:
             logger.info("Local multimodal runner used: %s", runner)
             break
@@ -1490,10 +1786,100 @@ def run_mtmd_task(
     return text
 
 
-def load_vision_pack(model_id="florence_base"):
+_ORIENTATION_COMMON_WORDS = {
+    "a", "about", "all", "an", "and", "are", "as", "at", "be", "been",
+    "but", "by", "can", "do", "for", "from", "had", "has", "have", "if",
+    "in", "is", "it", "may", "not", "of", "on", "one", "or", "our",
+    "page", "so", "that", "the", "their", "there", "they", "this", "to",
+    "was", "we", "were", "which", "will", "with", "you", "your",
+}
+
+
+def _orientation_transcript_score(text):
+    """Score whether rotation-specific OCR resembles readable English text."""
+    words = re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)?", text.lower())
+    if len(words) < 4:
+        return -10000.0
+    common = sum(word in _ORIENTATION_COMMON_WORDS for word in words)
+    plausible = sum(
+        2 <= len(word) <= 20 and any(letter in "aeiouy" for letter in word)
+        for word in words
+    )
+    strange = sum(
+        len(word) > 24 or not any(letter in "aeiouy" for letter in word)
+        for word in words
+    )
+    return common * 30 + plausible * 3 + len(text) * 0.02 - strange * 8
+
+
+def detect_document_rotation(image_path):
+    """Return a strongly supported clockwise text rotation, or None."""
+    if sys.platform == "darwin":
+        return macos_document_rotation(image_path)
+    temporary_paths = []
+    transcripts = {}
+    native_ocr = (
+        windows_ocr if sys.platform == "win32"
+        else macos_ocr if sys.platform == "darwin"
+        else None
+    )
+    candidates = (
+        ("A", 0, None),
+        ("B", 90, Image.Transpose.ROTATE_270),
+        ("C", 180, Image.Transpose.ROTATE_180),
+        ("D", 270, Image.Transpose.ROTATE_90),
+    )
+    try:
+        if native_ocr is not None:
+            with Image.open(image_path) as opened:
+                source = ImageOps.exif_transpose(opened).convert("RGB")
+                for label, _degrees, transpose in candidates:
+                    candidate_path = os.path.join(
+                        TEMP_DIR,
+                        f"orientation_candidate_{uuid.uuid4().hex}.png",
+                    )
+                    candidate = (
+                        source if transpose is None
+                        else source.transpose(transpose)
+                    )
+                    candidate.save(candidate_path, "PNG")
+                    temporary_paths.append(candidate_path)
+                    transcripts[label] = native_ocr(candidate_path).strip()[:1000]
+        scores = {
+            label: _orientation_transcript_score(transcripts.get(label, ""))
+            for label, _degrees, _transpose in candidates
+        }
+    finally:
+        _remove_quietly(*temporary_paths)
+    ranked = sorted(scores, key=scores.get, reverse=True)
+    best, second = ranked[:2]
+    margin = scores[best] - scores[second]
+    logger.info(
+        "Orientation transcript_scores=%s best=%s margin=%.1f",
+        {label: round(score, 1) for label, score in scores.items()},
+        best,
+        margin,
+    )
+    if scores[best] < 20 or margin < 40:
+        logger.warning(
+            "Document orientation is uncertain for %s: best=%s margin=%.1f",
+            image_path,
+            best,
+            margin,
+        )
+        return None
+    return {"A": 0, "B": 90, "C": 180, "D": 270}[best]
+
+
+def load_vision_pack(model_id=DEFAULT_VISION_MODEL_ID):
     """Return the install manifest for a supported local model."""
-    model = VISION_MODELS.get(model_id, VISION_MODELS["florence_base"])
-    builtin_path = os.path.join(RESOURCE_BASE, "config", model["manifest"])
+    model = VISION_MODELS.get(model_id, VISION_MODELS[DEFAULT_VISION_MODEL_ID])
+    manifest_name = (
+        model.get("mac_manifest", model["manifest"])
+        if sys.platform == "darwin"
+        else model["manifest"]
+    )
+    builtin_path = os.path.join(RESOURCE_BASE, "config", manifest_name)
     if os.path.exists(builtin_path):
         with open(builtin_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -1507,8 +1893,8 @@ def _vision_search_dirs():
     return dirs
 
 
-def install_local_ai_pack(status_callback=None, model_id="florence_base", cancel_event=None):
-    model = VISION_MODELS.get(model_id, VISION_MODELS["florence_base"])
+def install_local_ai_pack(status_callback=None, model_id=DEFAULT_VISION_MODEL_ID, cancel_event=None):
+    model = VISION_MODELS.get(model_id, VISION_MODELS[DEFAULT_VISION_MODEL_ID])
     manifest = load_vision_pack(model_id)
     files = manifest.get("files", [])
     if not files:
@@ -1591,8 +1977,8 @@ def run_vision_task(task, image_path, cancel_event=None):
     """Run the local model selected in Settings."""
     if task != "describe":
         return run_florence_task(task, image_path)
-    model_id = read_app_settings().get("vision_model", "florence_base")
-    model = VISION_MODELS.get(model_id, VISION_MODELS["florence_base"])
+    model_id = read_app_settings().get("vision_model", DEFAULT_VISION_MODEL_ID)
+    model = VISION_MODELS.get(model_id, VISION_MODELS[DEFAULT_VISION_MODEL_ID])
     started = time.perf_counter()
     if model["runner"] == "florence":
         text = run_florence_task(task, image_path, cancel_event)
@@ -2034,6 +2420,216 @@ def macos_ocr(path):
         return ""
 
 
+def macos_document_rotation(path):
+    """Infer physical text direction using Vision character geometry."""
+    if sys.platform != "darwin" or not os.path.isfile(MACOS_CAPTURE_HELPER):
+        return None
+    try:
+        started = time.perf_counter()
+        result = subprocess.run(
+            [MACOS_CAPTURE_HELPER, "orientation", os.path.abspath(path)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            **NO_WINDOW,
+        )
+        value = result.stdout.strip()
+        rotation = int(value) if value in {"0", "90", "180", "270"} else None
+        logger.info(
+            "macOS Vision orientation finished elapsed=%.2fs image=%s result=%s",
+            time.perf_counter() - started,
+            path,
+            rotation if rotation is not None else "unknown",
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "macOS Vision orientation failed: %s", result.stderr.strip()
+            )
+            return None
+        return rotation
+    except Exception:
+        logger.exception("macOS Vision orientation failed for %s", path)
+        return None
+
+
+def macos_choose_files_via_osascript(
+    title, initial_directory, multiple=False, extensions=()
+):
+    """Show Apple's Open dialog via AppleScript's `choose file`, run
+    through `osascript` as a genuinely separate OS process with its own
+    AppKit event loop.
+
+    Two earlier approaches - wx.FileDialog, and NSOpenPanel called
+    in-process via PyObjC - looked different in code but behaved
+    identically for VoiceOver: no arrow-key or type-to-select navigation,
+    no working search field, poor tab order. Both ran inside ScanBox's own
+    process, and wxWidgets owns the single NSApplication instance and main
+    event loop for that whole process, so neither could actually escape
+    wx's own keyboard/event handling. `choose file` is a long-established
+    system utility that opens its own window with its own, real event
+    loop, entirely outside wx's control.
+
+    Returns a list of selected paths (empty if the user cancelled), or
+    None if osascript itself is unavailable/failed unexpectedly, so the
+    caller can fall back to wx.FileDialog.
+    """
+    if sys.platform != "darwin":
+        return None
+    lines = [f'set thePrompt to "{_applescript_quote(title)}"']
+    choose_clause = "choose file with prompt thePrompt"
+    if extensions:
+        type_list = ", ".join(f'"{ext}"' for ext in extensions)
+        lines.append(f"set theTypes to {{{type_list}}}")
+        choose_clause += " of type theTypes"
+    if initial_directory and os.path.isdir(initial_directory):
+        quoted_dir = _applescript_quote(initial_directory)
+        lines.append(f'set theLocation to POSIX file "{quoted_dir}"')
+        choose_clause += " default location theLocation"
+    if multiple:
+        choose_clause += " with multiple selections allowed"
+    lines.append(f"set theResult to {choose_clause}")
+    lines.append(
+        "if (class of theResult) is list then\n"
+        "    set posixPaths to {}\n"
+        "    repeat with anItem in theResult\n"
+        "        set end of posixPaths to POSIX path of anItem\n"
+        "    end repeat\n"
+        "else\n"
+        "    set posixPaths to {POSIX path of theResult}\n"
+        "end if\n"
+        "set AppleScript's text item delimiters to linefeed\n"
+        "return posixPaths as text"
+    )
+    script = "\n".join(lines)
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            if "-128" in stderr:
+                # The user cancelled the dialog.
+                return []
+            logger.warning("osascript file chooser failed: %s", stderr)
+            return None
+        return [line for line in result.stdout.splitlines() if line]
+    except Exception:
+        logger.exception("osascript file chooser failed")
+        return None
+
+
+def _applescript_quote(text):
+    """Escape a plain string for safe embedding inside a double-quoted
+    AppleScript string literal."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def choose_macos_files_async(parent, title, start_dir, completed, multiple=False, extensions=()):
+    """Run macos_choose_files_via_osascript() on a background thread and
+    deliver the result back to the UI thread via wx.CallAfter.
+
+    osascript blocks for as long as its own window is open, which may be
+    a long time while the user browses. Waiting for it on wx's own thread
+    would stop wx's event loop from pumping for that whole time, which
+    macOS would report as ScanBox being unresponsive even though a
+    separate, genuinely working window is showing. A background thread
+    avoids that.
+    """
+
+    def choose():
+        paths = macos_choose_files_via_osascript(
+            title, start_dir, multiple=multiple, extensions=extensions
+        )
+        if paths is None:
+            wx.CallAfter(
+                wx.MessageBox,
+                "ScanBox could not open the native file chooser. Please "
+                "check the log and try again.",
+                "Import failed",
+            )
+            return
+        wx.CallAfter(completed, paths)
+
+    threading.Thread(
+        target=choose, name="ScanBox macOS file chooser", daemon=True
+    ).start()
+
+
+def macos_capture_window(window_id, output_path):
+    """Capture a macOS window from the main ScanBox app process."""
+    try:
+        from AppKit import NSBitmapImageFileTypePNG, NSBitmapImageRep
+        from Quartz import (
+            CGRectNull,
+            CGWindowListCreateImage,
+            kCGWindowImageBoundsIgnoreFraming,
+            kCGWindowImageDefault,
+            kCGWindowListOptionIncludingWindow,
+            kCGWindowListOptionOnScreenOnly,
+        )
+
+        image = CGWindowListCreateImage(
+            CGRectNull,
+            kCGWindowListOptionIncludingWindow,
+            int(window_id),
+            kCGWindowImageBoundsIgnoreFraming,
+        )
+        if image is None:
+            logger.warning("Quartz window capture returned no image for window %s", window_id)
+            image = CGWindowListCreateImage(
+                CGRectNull,
+                kCGWindowListOptionOnScreenOnly,
+                0,
+                kCGWindowImageDefault,
+            )
+        if image is None:
+            raise RuntimeError("Screen Recording permission was not granted.")
+        rep = NSBitmapImageRep.alloc().initWithCGImage_(image)
+        data = rep.representationUsingType_properties_(NSBitmapImageFileTypePNG, {})
+        if data is None or not data.writeToFile_atomically_(output_path, True):
+            raise RuntimeError("The captured screen image could not be saved.")
+        logger.info("macOS Quartz captured window/display to %s", output_path)
+        return output_path
+    except ImportError:
+        logger.exception("Quartz capture support is not installed")
+    except Exception:
+        logger.exception("macOS Quartz capture failed")
+
+    command = ["/usr/sbin/screencapture", "-x", "-l", str(window_id), output_path]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    if result.returncode == 0 and os.path.isfile(output_path):
+        logger.info("macOS captured window %s to %s", window_id, output_path)
+        return output_path
+    detail = (result.stderr or result.stdout or "").strip()
+    logger.warning("macOS window capture failed: %s", detail or result.returncode)
+    # Some windows cannot be captured by id even when Screen Recording is
+    # granted. Fall back to the visible display so the global workflow still
+    # works; this is less precise, but it is far better than a dead shortcut.
+    result = subprocess.run(
+        ["/usr/sbin/screencapture", "-x", output_path],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    if result.returncode != 0 or not os.path.isfile(output_path):
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(detail or "Screen Recording permission was not granted.")
+    logger.info("macOS captured full screen to %s after window capture fallback", output_path)
+    return output_path
+
+
 _INVALID_XML_TEXT = re.compile(
     r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]"
 )
@@ -2143,7 +2739,13 @@ class ScanBox(wx.Frame):
         self.busy_status_visible = False
         self.busy_status_token = 0
         self.app_settings = read_app_settings()
-        configure_logging(self.app_settings.get("diagnostic_logging", False))
+        force_logging = os.environ.get("SCANBOX_FORCE_LOGGING") == "1"
+        configure_logging(
+            force_logging
+            or self.app_settings.get("diagnostic_logging", False)
+        )
+        if force_logging:
+            logger.info("macOS test logging forced; log file: %s", LOG_FILE)
         self.created_output_files = []
         self.tray_icon = None
         self._restore_focus = None
@@ -2167,22 +2769,44 @@ class ScanBox(wx.Frame):
         self.facealign_dialog = None
         self.facealign_status = None
         self.facealign_restore_focus = None
+        self.image_export_active = False
+        self.image_export_multiple = False
+        self.image_export_paths = []
+        self.image_export_rotations = {}
 
         menu_bar = wx.MenuBar()
         help_menu = wx.Menu()
         manual_item = help_menu.Append(wx.ID_HELP, "&User Manual\tF1")
+        permissions_item = None
+        if sys.platform == "darwin":
+            permissions_item = help_menu.Append(wx.ID_ANY, "Mac &Permissions")
         self.check_updates_item = help_menu.Append(wx.ID_ANY, "Check for &Updates")
         donate_item = help_menu.Append(wx.ID_ANY, "&Donate to Project")
         license_item = help_menu.Append(wx.ID_ANY, "&License")
         help_menu.AppendSeparator()
         about_item = help_menu.Append(wx.ID_ABOUT, "&About ScanBox...")
         menu_bar.Append(help_menu, "&Help")
+        quit_item = None
+        if sys.platform == "darwin":
+            # wxWidgets moves a wx.ID_EXIT menu item into the application
+            # menu and wires Command+Q to it automatically on macOS -  but
+            # only if one exists somewhere in the menu bar. ScanBox had no
+            # File/Quit menu at all, so Command+Q silently did nothing; the
+            # only way to close the app was Cmd+Tab to something else and
+            # quit from there, or force-quit. "Ctrl+Q" in a wx accelerator
+            # is the standard way to request Command+Q specifically on Mac
+            # (wx maps Ctrl to Command in accelerators on this platform).
+            quit_item = help_menu.Append(wx.ID_EXIT, "&Quit ScanBox\tCtrl+Q")
         self.SetMenuBar(menu_bar)
         self.Bind(wx.EVT_MENU, self.open_user_manual, manual_item)
+        if permissions_item is not None:
+            self.Bind(wx.EVT_MENU, self.show_macos_permissions, permissions_item)
         self.Bind(wx.EVT_MENU, self.check_for_updates, self.check_updates_item)
         self.Bind(wx.EVT_MENU, self.open_donation_page, donate_item)
         self.Bind(wx.EVT_MENU, self.open_license, license_item)
         self.Bind(wx.EVT_MENU, self.show_about, about_item)
+        if quit_item is not None:
+            self.Bind(wx.EVT_MENU, lambda event: self.Close(), quit_item)
 
         panel = wx.Panel(self)
         root = wx.BoxSizer(wx.VERTICAL)
@@ -2193,14 +2817,23 @@ class ScanBox(wx.Frame):
         self.scan_panel = wx.Panel(self.mode_tabs)
         _set_named_page_accessible(self.scan_panel, "Scan")
         scan_sizer = wx.WrapSizer(wx.HORIZONTAL)
-        self.document_scan_btn = wx.Button(self.scan_panel, label="Scan Document")
+        self.document_scan_btn = wx.Button(
+            self.scan_panel, label="Scan and Read Document"
+        )
+        self.scan_save_images_btn = wx.Button(
+            self.scan_panel, label="Scan and Save Images"
+        )
         self.document_camera_btn = wx.Button(
             self.scan_panel, label="OCR using Camera"
         )
         self.photo_scan_btn = wx.Button(self.scan_panel, label="Scan Photo")
         self.photo_camera_btn = wx.Button(self.scan_panel, label="Take Photo")
         self.document_scan_btn.SetToolTip(
-            "Scan a document directly from a connected scanner."
+            "Scan a document and read its text."
+        )
+        self.scan_save_images_btn.SetToolTip(
+            "Scan without reading and save one JPEG image or one multi-page "
+            "PDF. ScanBox checks text orientation before saving."
         )
         self.document_camera_btn.SetToolTip(
             "Capture, straighten and recognise a page using a camera."
@@ -2215,6 +2848,7 @@ class ScanBox(wx.Frame):
             self.scan_panel, label="FaceAlign"
         )
         scan_sizer.Add(self.document_scan_btn, 0, wx.ALL, 6)
+        scan_sizer.Add(self.scan_save_images_btn, 0, wx.ALL, 6)
         scan_sizer.Add(self.document_camera_btn, 0, wx.ALL, 6)
         scan_sizer.Add(self.photo_scan_btn, 0, wx.ALL, 6)
         scan_sizer.Add(self.photo_camera_btn, 0, wx.ALL, 6)
@@ -2355,6 +2989,9 @@ class ScanBox(wx.Frame):
         self.document_scan_btn.Bind(
             wx.EVT_BUTTON, lambda event: self.on_scan(event, False)
         )
+        self.scan_save_images_btn.Bind(
+            wx.EVT_BUTTON, self.on_scan_and_save_images
+        )
         self.document_camera_btn.Bind(
             wx.EVT_BUTTON, lambda event: self.on_camera_capture(event, False)
         )
@@ -2436,13 +3073,22 @@ class ScanBox(wx.Frame):
             id=self.toggle_window_hotkey_id,
         )
         if sys.platform == "darwin":
-            self._start_macos_helper()
+            pass
         elif sys.platform != "win32":
             logger.info("Global screen shortcuts are unavailable on this platform.")
         settings_id = wx.NewIdRef()
         self.Bind(wx.EVT_MENU, self.open_settings, id=settings_id)
+        accelerators = [
+            (
+                wx.ACCEL_CMD if sys.platform == "darwin" else wx.ACCEL_CTRL,
+                ord(","),
+                settings_id,
+            )
+        ]
+        if sys.platform == "darwin":
+            accelerators.append((wx.ACCEL_CMD, ord("Q"), wx.ID_EXIT))
         self.SetAcceleratorTable(
-            wx.AcceleratorTable([(wx.ACCEL_CTRL, ord(","), settings_id)])
+            wx.AcceleratorTable(accelerators)
         )
 
         self.button_sizer = wx.WrapSizer(wx.HORIZONTAL)
@@ -2481,14 +3127,17 @@ class ScanBox(wx.Frame):
         # manually maximizing was needed before NVDA had a comfortable
         # amount of visible text to work with.
         self.Maximize(True)
-        # Warm the optional in-process Florence engine away from the UI thread.
-        # This keeps the first Photo import responsive when a model is already
-        # installed, while remaining a no-op when local AI is not configured.
-        threading.Thread(
-            target=self._preload_local_ai,
-            name="ScanBox AI preload",
-            daemon=True,
-        ).start()
+        # On macOS, privacy prompts from helpers can appear behind other
+        # windows if several background tasks start at once. Sequence the
+        # permission prompts before the hotkey helper and model preload.
+        if sys.platform == "darwin":
+            wx.CallLater(800, self._start_macos_startup_sequence)
+        else:
+            threading.Thread(
+                target=self._preload_local_ai,
+                name="ScanBox AI preload",
+                daemon=True,
+            ).start()
         if self.app_settings.get("check_for_updates_on_startup", True):
             # Wait until the frame is visible before a newer-release prompt
             # can appear. A startup check stays silent when current or offline.
@@ -2496,7 +3145,7 @@ class ScanBox(wx.Frame):
 
     def _preload_local_ai(self):
         try:
-            model_id = self.app_settings.get("vision_model", "florence_base")
+            model_id = self.app_settings.get("vision_model", DEFAULT_VISION_MODEL_ID)
             if model_id == "qwen3_vl_2b" and vision_ready():
                 total_memory = _total_physical_memory()
                 if total_memory >= QWEN_PRELOAD_MINIMUM_RAM:
@@ -2511,6 +3160,125 @@ class ScanBox(wx.Frame):
                 logger.info("Florence-2 Base model preloaded in background.")
         except Exception:
             logger.exception("Background local AI preload failed")
+
+    def _start_macos_startup_sequence(self):
+        if sys.platform == "darwin" and not self.app_settings.get(
+            "mac_permissions_prompted", False
+        ):
+            self.show_macos_permissions()
+        threading.Thread(
+            target=self._macos_startup_worker,
+            name="ScanBox macOS startup permissions",
+            daemon=True,
+        ).start()
+
+    def _macos_startup_worker(self):
+        wx.CallAfter(self._start_macos_helper)
+        time.sleep(12)
+        self._preload_local_ai()
+
+    def show_macos_permissions(self, event=None):
+        if sys.platform != "darwin":
+            return
+        dialog = wx.Dialog(self, title="Mac Permissions")
+        reset_performed = False
+        root = wx.BoxSizer(wx.VERTICAL)
+        intro = wx.StaticText(
+            dialog,
+            label=(
+                "ScanBox needs Screen Recording for global screen description "
+                "and OCR, and Accessibility for Mac global shortcuts. Use the "
+                "buttons below, grant the permission in System Settings, then "
+                "restart ScanBox."
+            ),
+        )
+        intro.Wrap(560)
+        root.Add(intro, 0, wx.ALL | wx.EXPAND, 12)
+
+        rows = wx.FlexGridSizer(cols=2, hgap=8, vgap=8)
+        rows.AddGrowableCol(1, 1)
+
+        def add_row(label, button_label, handler):
+            button = wx.Button(dialog, label=button_label)
+            button.Bind(wx.EVT_BUTTON, handler)
+            text = wx.StaticText(dialog, label=label)
+            text.Wrap(390)
+            rows.Add(button, 0, wx.EXPAND)
+            rows.Add(text, 0, wx.EXPAND | wx.ALIGN_CENTER_VERTICAL)
+
+        add_row(
+            "Required for Control Backslash and Control Shift Backslash.",
+            "Open Screen Recording",
+            lambda event: open_macos_privacy_pane("Privacy_ScreenCapture"),
+        )
+        add_row(
+            "Required for global shortcuts and locating the active window.",
+            "Open Accessibility",
+            lambda event: open_macos_privacy_pane("Privacy_Accessibility"),
+        )
+
+        def reset_permissions(event):
+            nonlocal reset_performed
+            if wx.MessageBox(
+                "Reset ScanBox permissions so macOS will ask again? "
+                "You must quit and reopen ScanBox afterwards.",
+                "Reset Permissions",
+                wx.YES_NO | wx.ICON_WARNING,
+                dialog,
+            ) != wx.YES:
+                return
+            try:
+                reset_macos_scanbox_permissions()
+                reset_performed = True
+                self.app_settings["mac_permissions_prompted"] = False
+                write_app_settings(self.app_settings)
+                wx.MessageBox(
+                    "ScanBox permissions were reset. Quit and reopen ScanBox, "
+                    "then grant the permissions again.",
+                    "Permissions Reset",
+                    wx.OK | wx.ICON_INFORMATION,
+                    dialog,
+                )
+            except Exception as exc:
+                wx.MessageBox(
+                    f"ScanBox could not reset permissions.\n\n{exc}",
+                    "Reset Failed",
+                    wx.OK | wx.ICON_ERROR,
+                    dialog,
+                )
+
+        add_row(
+            "Use this if macOS says permission is on but capture still fails.",
+            "Reset ScanBox Permissions",
+            reset_permissions,
+        )
+
+        root.Add(rows, 0, wx.ALL | wx.EXPAND, 12)
+        dont_show_again = wx.CheckBox(
+            dialog,
+            label="Don't show this permissions guide again at startup",
+        )
+        dont_show_again.SetValue(True)
+        root.Add(dont_show_again, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
+        buttons = dialog.CreateButtonSizer(wx.OK)
+        root.Add(buttons, 0, wx.ALL | wx.ALIGN_RIGHT, 12)
+        dialog.SetSizerAndFit(root)
+        dialog.SetMinSize((680, -1))
+        dialog.CentreOnParent()
+        suppress_startup_guide = True
+        try:
+            dialog.ShowModal()
+            suppress_startup_guide = dont_show_again.GetValue()
+        finally:
+            dialog.Destroy()
+        # Reset deliberately clears the startup choice so the guide appears
+        # again after relaunch. Do not immediately overwrite that choice when
+        # this dialog closes.
+        if not reset_performed:
+            self.app_settings["mac_permissions_prompted"] = (
+                suppress_startup_guide
+            )
+            write_app_settings(self.app_settings)
 
     def open_user_manual(self, event=None):
         """Open the bundled user manual in the default web browser."""
@@ -2835,7 +3603,7 @@ class ScanBox(wx.Frame):
                 pass
 
     def _ask_screen_question(self, path, restore_window=None, restore_app=""):
-        model_id = self.app_settings.get("vision_model", "florence_base")
+        model_id = self.app_settings.get("vision_model", DEFAULT_VISION_MODEL_ID)
         qwen_installed = (
             _find_mtmd_model_files("qwen3_vl_2b") is not None
             and _find_mtmd_runner() is not None
@@ -2961,6 +3729,25 @@ class ScanBox(wx.Frame):
                 MACOS_CAPTURE_HELPER,
             )
             return
+        # A helper from a previous, force-quit ScanBox session (rather than
+        # a normal Cmd+Q, which terminates it in on_close) can be left
+        # running. Carbon's global hotkeys are registered per key
+        # combination system-wide, so a stray helper still holding those
+        # registrations makes this session's own registration attempts
+        # silently lose the combo to the orphaned process - the shortcuts
+        # then work or not depending on which helper happens to still be
+        # alive, which looks exactly like intermittent failure. Clearing
+        # out any stray copies first guarantees only this session's helper
+        # ever holds the registrations.
+        try:
+            subprocess.run(
+                ["pkill", "-f", MACOS_CAPTURE_HELPER],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.3)
+        except Exception:
+            logger.exception("Could not clear stray macOS helper processes")
         try:
             self._mac_helper_process = subprocess.Popen(
                 [MACOS_CAPTURE_HELPER, "listen", TEMP_DIR],
@@ -2984,6 +3771,30 @@ class ScanBox(wx.Frame):
             _mac_announce_process = None
             logger.exception("Could not start the macOS global-shortcut helper")
 
+    def _request_macos_screen_recording_permission(self):
+        try:
+            result = subprocess.run(
+                [MACOS_CAPTURE_HELPER, "request-screen-recording"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            status = result.stdout.strip()
+            logger.info(
+                "macOS Screen Recording permission request returned: %s stderr=%r",
+                status or f"exit {result.returncode}",
+                result.stderr,
+            )
+            if status != "granted":
+                wx.CallAfter(
+                    self.SetStatusText,
+                    "Screen Recording permission is needed for screen shortcuts.",
+                )
+        except Exception:
+            logger.exception("Could not request macOS Screen Recording permission")
+
     def _read_macos_helper_events(self):
         process = self._mac_helper_process
         if process is None or process.stdout is None:
@@ -2994,12 +3805,18 @@ class ScanBox(wx.Frame):
                 if not line:
                     continue
                 kind, _separator, value = line.partition("\t")
-                if kind in {"describe", "ocr", "ask", "toggle", "error", "fatal"}:
+                if kind in {
+                    "describe", "ocr", "ask", "toggle", "error", "fatal",
+                    "accessibility", "ready", "hotkey",
+                }:
                     wx.CallAfter(self._handle_macos_helper_event, kind, value)
                 else:
                     logger.warning("macOS helper: %s", line)
         except Exception:
             logger.exception("macOS helper event reader failed")
+        finally:
+            return_code = process.poll()
+            logger.warning("macOS helper event reader stopped; returncode=%s", return_code)
 
     def _handle_macos_helper_event(self, kind, value=""):
         if kind == "fatal":
@@ -3012,8 +3829,17 @@ class ScanBox(wx.Frame):
                 self,
             )
             return
+        if kind == "ready":
+            logger.info("macOS global-shortcut helper ready: %s", value)
+            return
+        if kind == "hotkey":
+            logger.info("macOS global shortcut pressed: %s", value)
+            return
         if kind == "toggle":
             self.toggle_window_visibility()
+            return
+        if kind == "accessibility":
+            logger.warning("macOS Accessibility reminder: %s", value)
             return
         if kind == "error":
             wx.MessageBox(
@@ -3029,7 +3855,30 @@ class ScanBox(wx.Frame):
 
         restore_app = ""
         path = value
-        if kind == "ask" and "\t" in value:
+        if value.startswith("window\t"):
+            fields = value.split("\t")
+            if kind == "ask" and len(fields) >= 4:
+                _tag, window_id, path, restore_app = fields[:4]
+            elif len(fields) >= 3:
+                _tag, window_id, path = fields[:3]
+            else:
+                logger.warning("Malformed macOS window capture event: %r", value)
+                return
+            try:
+                macos_capture_window(window_id, path)
+            except Exception as exc:
+                logger.exception("macOS window capture failed")
+                wx.MessageBox(
+                    "ScanBox could not capture the active window.\n\n"
+                    f"{exc}\n\n"
+                    "Allow Screen Recording for ScanBox in System Settings > "
+                    "Privacy & Security > Screen Recording, then try again.",
+                    "Screen capture failed",
+                    wx.OK | wx.ICON_ERROR,
+                    self,
+                )
+                return
+        elif kind == "ask" and "\t" in value:
             path, restore_app = value.split("\t", 1)
         if kind not in {"describe", "ocr", "ask"} or not os.path.isfile(path):
             return
@@ -3110,7 +3959,7 @@ class ScanBox(wx.Frame):
 
     def _screen_question_worker(self, path, question):
         try:
-            model_id = self.app_settings.get("vision_model", "florence_base")
+            model_id = self.app_settings.get("vision_model", DEFAULT_VISION_MODEL_ID)
             prompt = (
                 "Answer the user's question using only evidence visible in the image. "
                 "Be clear and concise, but include the detail needed to answer fully. "
@@ -3264,7 +4113,9 @@ class ScanBox(wx.Frame):
             self.camera_capture_active
             or self.camera_alignment_active
         )
-        interaction_locked = self.busy or camera_workflow_active
+        interaction_locked = bool(
+            self.busy or camera_workflow_active or self.image_export_active
+        )
         # Scan and Import are no longer split one-tab-per-mode - both handle
         # document and photo actions together - so which is "active" for
         # Save/status purposes now follows whichever action ran last rather
@@ -3272,7 +4123,7 @@ class ScanBox(wx.Frame):
         is_photo_mode = self.last_active_mode == "photo"
         is_library_mode = self.mode_tabs.GetSelection() == self.TAB_LIBRARY
         active_mode = "photo" if is_photo_mode else "document"
-        has_scanned_images = any(
+        has_scanned_images = is_photo_mode and any(
             source in {"scan", "camera"} and mode == active_mode
             for source, mode in zip(
                 self.session_file_sources, self.session_file_modes
@@ -3341,6 +4192,7 @@ class ScanBox(wx.Frame):
 
         self.mode_tabs.Enable(not interaction_locked)
         self.document_scan_btn.Enable(not interaction_locked)
+        self.scan_save_images_btn.Enable(not interaction_locked)
         self.document_camera_btn.Enable(not interaction_locked)
         self.document_import_btn.Enable(not interaction_locked)
         self.use_ocr_checkbox.Enable(not interaction_locked)
@@ -3678,7 +4530,15 @@ class ScanBox(wx.Frame):
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=20,
+                # Wi-Fi scanners are often advertised after local devices.
+                # The native helper deliberately waits up to 30 seconds for
+                # them, so ScanBox must not kill it beforehand.
+                timeout=40,
+            )
+            logger.info(
+                "macOS scanner discovery stdout=%r stderr=%r",
+                listed.stdout,
+                listed.stderr,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             logger.exception("Could not enumerate macOS scanners")
@@ -3697,6 +4557,7 @@ class ScanBox(wx.Frame):
             if identifier and separator:
                 scanners.append((identifier, name or "Unnamed scanner"))
         if not scanners:
+            logger.warning("macOS ImageCaptureCore reported no scanners")
             wx.MessageBox(
                 "No scanner was found. Confirm that the scanner is switched "
                 "on and available to macOS, then try again.",
@@ -3734,6 +4595,7 @@ class ScanBox(wx.Frame):
         except (OSError, subprocess.SubprocessError) as exc:
             logger.exception("macOS scanner acquisition failed")
             detail = getattr(exc, "stderr", "") or str(exc)
+            logger.error("macOS scanner acquisition detail: %s", detail.strip())
             wx.MessageBox(
                 f"ScanBox could not complete the scan.\n\n{detail.strip()}",
                 "Scan failed",
@@ -3757,6 +4619,8 @@ class ScanBox(wx.Frame):
         )
 
     def available_camera_indexes(self):
+        if sys.platform == "darwin":
+            return sorted(self.camera_device_names())
         if cv2 is None:
             return []
         backend = self.camera_backend()
@@ -3832,7 +4696,7 @@ class ScanBox(wx.Frame):
 
     def choose_camera(self, front_facing_only=False):
         """Return a camera index selected from the detected devices."""
-        if cv2 is None:
+        if cv2 is None and sys.platform != "darwin":
             wx.MessageBox(
                 "Camera capture requires OpenCV. Install the full ScanBox "
                 "dependencies or use Import instead.",
@@ -3910,6 +4774,40 @@ class ScanBox(wx.Frame):
             camera_index = self.choose_camera()
             if camera_index is None:
                 return None
+        if sys.platform == "darwin":
+            path = os.path.join(TEMP_DIR, f"camera_{uuid.uuid4().hex}.png")
+            try:
+                result = subprocess.run(
+                    [
+                        MACOS_CAPTURE_HELPER,
+                        "capture-camera",
+                        str(camera_index),
+                        path,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                )
+                if not os.path.isfile(path):
+                    raise RuntimeError(
+                        result.stderr.strip()
+                        or "The camera did not return an image."
+                    )
+                play_shutter_sound()
+                return path
+            except Exception as exc:
+                logger.exception("Native macOS camera capture failed")
+                detail = getattr(exc, "stderr", "") or str(exc)
+                wx.MessageBox(
+                    "ScanBox could not capture an image from the camera.\n\n"
+                    + detail.strip(),
+                    "Camera capture failed",
+                )
+                _remove_quietly(path)
+                return None
         camera = cv2.VideoCapture(camera_index, self.camera_backend())
         try:
             if not camera.isOpened():
@@ -3967,9 +4865,232 @@ class ScanBox(wx.Frame):
         if self.photo_mode_blocked(is_photo_mode):
             return
         self.last_active_mode = "photo" if is_photo_mode else "document"
+        if not is_photo_mode:
+            # A prior photograph description is not relevant while the user
+            # is beginning a document-OCR task. Clear it before scanner
+            # selection/acquisition, rather than leaving stale text on screen.
+            self.prepare_output_buffer()
         path = self.scan_page()
         if path:
             self.process_image(path, is_photo_mode, "scan")
+
+    def on_scan_and_save_images(self, event=None):
+        """Scan without OCR and export one JPEG or one multi-page PDF."""
+        if self.busy or self.image_export_active:
+            return
+        choices = [
+            "Single page image — save as JPEG",
+            "Multiple page document — save as one PDF",
+        ]
+        dialog = wx.SingleChoiceDialog(
+            self,
+            "What would you like to scan and save?",
+            "Scan and Save Images",
+            choices,
+        )
+        dialog.SetSelection(0)
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            multiple = dialog.GetSelection() == 1
+        finally:
+            dialog.Destroy()
+
+        self.image_export_active = True
+        self.image_export_multiple = multiple
+        self.image_export_paths = []
+        self.image_export_rotations = {}
+        self.update_controls()
+        self._scan_image_export_page()
+
+    def _scan_image_export_page(self):
+        path = self.scan_page()
+        if not path:
+            if self.image_export_paths and self.image_export_multiple:
+                self._prompt_for_another_export_page()
+            else:
+                self._finish_image_export()
+            return
+        self.image_export_paths.append(path)
+        self.begin_busy("ScanBox is checking the page orientation.")
+        threading.Thread(
+            target=self._image_export_orientation_worker,
+            args=(path,),
+            name="ScanBox image orientation",
+            daemon=True,
+        ).start()
+
+    def _image_export_orientation_worker(self, path):
+        try:
+            rotation = detect_document_rotation(path)
+            logger.info(
+                "Image export orientation result for %s: %s",
+                path,
+                "unknown" if rotation is None else f"{rotation} degrees clockwise",
+            )
+        except Exception:
+            logger.exception("Image export orientation failed for %s", path)
+            rotation = None
+        wx.CallAfter(self._finish_image_export_orientation, path, rotation)
+
+    def _finish_image_export_orientation(self, path, rotation):
+        self.end_busy()
+        page_number = self.image_export_paths.index(path) + 1
+        correction = self._confirm_image_export_rotation(page_number, rotation)
+        if correction is None:
+            self._finish_image_export()
+            return
+        self.image_export_rotations[path] = correction
+        if self.image_export_multiple:
+            self._prompt_for_another_export_page()
+        else:
+            self._save_single_page_image()
+
+    def _confirm_image_export_rotation(self, page_number, rotation):
+        if rotation is None:
+            wx.MessageBox(
+                f"ScanBox could not confidently determine the orientation of page "
+                f"{page_number}. It will be saved as scanned.",
+                "Page orientation not determined",
+                wx.OK | wx.ICON_INFORMATION,
+                self,
+            )
+            return 0
+        if rotation == 0:
+            wx.MessageBox(
+                f"ScanBox reports that page {page_number} is upright. It will be "
+                "saved without rotation.",
+                "Page is upright",
+                wx.OK | wx.ICON_INFORMATION,
+                self,
+            )
+            return 0
+
+        dialog = wx.MessageDialog(
+            self,
+            f"ScanBox reports that page {page_number} needs to be rotated "
+            f"{rotation} degrees clockwise to make its text upright. It will "
+            "be rotated before export.",
+            "Page will be rotated",
+            wx.YES_NO | wx.CANCEL | wx.YES_DEFAULT | wx.ICON_QUESTION,
+        )
+        dialog.SetYesNoCancelLabels(
+            "Rotate and Continue", "Keep as Scanned", "Cancel"
+        )
+        try:
+            result = dialog.ShowModal()
+        finally:
+            dialog.Destroy()
+        if result == wx.ID_CANCEL:
+            logger.info("User cancelled export at page %s rotation prompt", page_number)
+            return None
+        if result == wx.ID_YES:
+            logger.info(
+                "User accepted %s-degree rotation for export page %s",
+                rotation,
+                page_number,
+            )
+            return rotation
+        logger.info("User kept export page %s as scanned", page_number)
+        return 0
+
+    def _prompt_for_another_export_page(self):
+        page_count = len(self.image_export_paths)
+        dialog = wx.MessageDialog(
+            self,
+            f"Page {page_count} is ready. Scan another page, or finish and "
+            "save all pages as one PDF?",
+            "Multiple page document",
+            wx.YES_NO | wx.CANCEL | wx.YES_DEFAULT | wx.ICON_QUESTION,
+        )
+        dialog.SetYesNoCancelLabels(
+            "Scan Another Page", "Finish and Save", "Cancel"
+        )
+        try:
+            result = dialog.ShowModal()
+        finally:
+            dialog.Destroy()
+        if result == wx.ID_YES:
+            self._scan_image_export_page()
+        elif result == wx.ID_NO:
+            self._save_multiple_page_pdf()
+        else:
+            self._finish_image_export()
+
+    def _save_single_page_image(self):
+        dialog = wx.FileDialog(
+            self,
+            "Save scanned image",
+            defaultDir=IMAGES_DIR,
+            defaultFile="Captured document.jpg",
+            wildcard="JPEG image (*.jpg)|*.jpg",
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT,
+        )
+        destination = ""
+        try:
+            if dialog.ShowModal() == wx.ID_OK:
+                source = self.image_export_paths[0]
+                destination = self.write_scanned_jpeg(
+                    source,
+                    dialog.GetPath(),
+                    self.image_export_rotations.get(source, 0),
+                )
+        except Exception as exc:
+            logger.exception("Could not save scanned image")
+            wx.MessageBox(
+                f"ScanBox could not save the scanned image.\n\n{exc}",
+                "Save failed",
+                wx.OK | wx.ICON_ERROR,
+                self,
+            )
+        finally:
+            dialog.Destroy()
+        self._finish_image_export()
+        if destination:
+            self.SetStatusText(f"Scanned image saved: {destination}")
+            announce("Scanned image saved.")
+
+    def _save_multiple_page_pdf(self):
+        dialog = wx.FileDialog(
+            self,
+            "Save scanned document",
+            defaultDir=IMAGES_DIR,
+            defaultFile="Captured document.pdf",
+            wildcard="PDF document (*.pdf)|*.pdf",
+            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT,
+        )
+        destination = ""
+        try:
+            if dialog.ShowModal() == wx.ID_OK:
+                destination = self.write_scanned_image_pdf(
+                    self.image_export_paths,
+                    dialog.GetPath(),
+                    self.image_export_rotations,
+                )
+        except Exception as exc:
+            logger.exception("Could not save scanned document")
+            wx.MessageBox(
+                f"ScanBox could not save the scanned document.\n\n{exc}",
+                "Save failed",
+                wx.OK | wx.ICON_ERROR,
+                self,
+            )
+        finally:
+            dialog.Destroy()
+        page_count = len(self.image_export_paths)
+        self._finish_image_export()
+        if destination:
+            self.SetStatusText(f"Scanned document saved: {destination}")
+            announce(f"Scanned document saved with {page_count} pages.")
+
+    def _finish_image_export(self):
+        _remove_quietly(*self.image_export_paths)
+        self.image_export_active = False
+        self.image_export_multiple = False
+        self.image_export_paths = []
+        self.image_export_rotations = {}
+        self.update_controls()
+        wx.CallAfter(self.scan_save_images_btn.SetFocus)
 
     def on_camera_capture(self, event, is_photo_mode):
         if self.photo_mode_blocked(is_photo_mode):
@@ -4087,17 +5208,19 @@ class ScanBox(wx.Frame):
         camera_index = self.choose_camera(front_facing_only=True)
         if camera_index is None:
             return
-        cascade_root = getattr(getattr(cv2, "data", None), "haarcascades", "")
-        cascade_path = os.path.join(
-            cascade_root, "haarcascade_frontalface_default.xml"
-        )
-        if not os.path.isfile(cascade_path):
-            wx.MessageBox(
-                "The local face-position detector is missing from this "
-                "ScanBox installation.",
-                "FaceAlign unavailable",
+        cascade_path = ""
+        if sys.platform != "darwin":
+            cascade_root = getattr(getattr(cv2, "data", None), "haarcascades", "")
+            cascade_path = os.path.join(
+                cascade_root, "haarcascade_frontalface_default.xml"
             )
-            return
+            if not os.path.isfile(cascade_path):
+                wx.MessageBox(
+                    "The local face-position detector is missing from this "
+                    "ScanBox installation.",
+                    "FaceAlign unavailable",
+                )
+                return
         self.camera_alignment_active = True
         self.camera_alignment_stop_event = threading.Event()
         self.facealign_restore_focus = launch_focus
@@ -4172,6 +5295,9 @@ class ScanBox(wx.Frame):
         self.stop_camera_alignment()
 
     def _camera_alignment_worker(self, camera_index, cascade_path, stop_event):
+        if sys.platform == "darwin":
+            self._macos_camera_alignment_worker(camera_index, stop_event)
+            return
         face_detector = cv2.CascadeClassifier(cascade_path)
         camera = cv2.VideoCapture(camera_index, self.camera_backend())
         error = ""
@@ -4238,6 +5364,62 @@ class ScanBox(wx.Frame):
                 stop_event,
             )
 
+    def _macos_camera_alignment_worker(self, camera_index, stop_event):
+        error = ""
+        process = None
+        try:
+            process = subprocess.Popen(
+                [MACOS_CAPTURE_HELPER, "face-align", str(camera_index)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            while not stop_event.is_set():
+                line = process.stdout.readline()
+                if not line:
+                    if process.poll() is not None:
+                        detail = process.stderr.read().strip()
+                        if process.returncode:
+                            raise RuntimeError(detail or "FaceAlign stopped unexpectedly.")
+                        break
+                    continue
+                fields = line.strip().split("\t")
+                if fields[0] == "no-face":
+                    guidance = "No face."
+                elif len(fields) == 3 and fields[0] == "face":
+                    x_percent = float(fields[1])
+                    y_percent = float(fields[2])
+                    position = (
+                        f"X {round(x_percent)} percent, "
+                        f"Y {round(y_percent)} percent."
+                    )
+                    if x_percent < 47.5:
+                        guidance = f"{position} Move left."
+                    elif x_percent > 52.5:
+                        guidance = f"{position} Move right."
+                    elif y_percent < 47.5:
+                        guidance = f"{position} Move down."
+                    elif y_percent > 52.5:
+                        guidance = f"{position} Move up."
+                    else:
+                        guidance = f"{position} Centred."
+                else:
+                    continue
+                wx.CallAfter(self._camera_alignment_announcement, guidance)
+        except Exception as exc:
+            logger.exception("Native macOS FaceAlign failed")
+            error = str(exc)
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            wx.CallAfter(self._finish_camera_alignment, error, stop_event)
+
     def _camera_alignment_announcement(self, message):
         if self.camera_alignment_active:
             self.SetStatusText(message)
@@ -4285,7 +5467,47 @@ class ScanBox(wx.Frame):
             "*.jpg;*.jpeg;*.png;*.tif;*.tiff;*.pdf"
         )
         last_dir = self.app_settings.get("last_import_dir", "")
-        start_dir = last_dir if last_dir and os.path.isdir(last_dir) else IMAGES_DIR
+        start_dir = last_dir if last_dir and os.path.isdir(last_dir) else (
+            os.path.expanduser("~") if sys.platform == "darwin" else IMAGES_DIR
+        )
+
+        def complete(source):
+            self.app_settings["last_import_dir"] = os.path.dirname(source)
+            write_app_settings(self.app_settings)
+            try:
+                if os.path.splitext(source)[1].lower() == ".pdf":
+                    if is_photo_mode:
+                        raise ValueError(
+                            "PDF import is available via Import Document."
+                        )
+                    self.process_pdf(source)
+                else:
+                    path = self.copy_imported_image(source)
+                    self.process_image(
+                        path, is_photo_mode, "import", library_path=source
+                    )
+            except Exception as exc:
+                wx.MessageBox(
+                    f"ScanBox could not import this file: {exc}", "Import failed"
+                )
+
+        # macOS: use AppleScript's `choose file` via osascript, run as a
+        # genuinely separate OS process with its own event loop, for real
+        # Finder-style keyboard/VoiceOver navigation. wx.FileDialog and an
+        # in-process NSOpenPanel via PyObjC were both tried first, but
+        # neither could actually escape wxWidgets' own ownership of the
+        # single NSApplication/event loop for this process - see git
+        # history.
+        if sys.platform == "darwin":
+            choose_macos_files_async(
+                self,
+                "Import image or PDF",
+                start_dir,
+                lambda paths: complete(paths[0]) if paths else None,
+                extensions=("jpg", "jpeg", "png", "tif", "tiff", "pdf"),
+            )
+            return
+
         dlg = wx.FileDialog(
             self,
             "Import image or PDF",
@@ -4295,29 +5517,7 @@ class ScanBox(wx.Frame):
         )
         try:
             if dlg.ShowModal() == wx.ID_OK:
-                source = dlg.GetPath()
-                self.app_settings["last_import_dir"] = os.path.dirname(source)
-                write_app_settings(self.app_settings)
-                try:
-                    if os.path.splitext(source)[1].lower() == ".pdf":
-                        if is_photo_mode:
-                            raise ValueError(
-                                "PDF import is available via Import Document."
-                            )
-                        self.process_pdf(source)
-                    else:
-                        path = self.copy_imported_image(source)
-                        self.process_image(
-                            path,
-                            is_photo_mode,
-                            "import",
-                            library_path=source,
-                        )
-                except Exception as exc:
-                    wx.MessageBox(
-                        f"ScanBox could not import this file: {exc}",
-                        "Import failed",
-                    )
+                complete(dlg.GetPath())
         finally:
             dlg.Destroy()
 
@@ -4330,12 +5530,40 @@ class ScanBox(wx.Frame):
         if self.photo_mode_blocked(False):
             return
         self.last_active_mode = "document"
+        self.prepare_output_buffer()
         wildcard = (
             "Images and PDF (*.jpg;*.jpeg;*.png;*.tif;*.tiff;*.pdf)|"
             "*.jpg;*.jpeg;*.png;*.tif;*.tiff;*.pdf"
         )
         last_dir = self.app_settings.get("last_import_dir", "")
-        start_dir = last_dir if last_dir and os.path.isdir(last_dir) else IMAGES_DIR
+        start_dir = last_dir if last_dir and os.path.isdir(last_dir) else (
+            os.path.expanduser("~") if sys.platform == "darwin" else IMAGES_DIR
+        )
+
+        def complete(source):
+            self.app_settings["last_import_dir"] = os.path.dirname(source)
+            write_app_settings(self.app_settings)
+            try:
+                if os.path.splitext(source)[1].lower() == ".pdf":
+                    self.process_pdf(source)
+                else:
+                    path = self.copy_imported_image(source)
+                    self.process_image(path, False, "import", library_path=source)
+            except Exception as exc:
+                wx.MessageBox(
+                    f"ScanBox could not import this file: {exc}", "Import failed"
+                )
+
+        if sys.platform == "darwin":
+            choose_macos_files_async(
+                self,
+                "Choose a document to import",
+                start_dir,
+                lambda paths: complete(paths[0]) if paths else None,
+                extensions=("jpg", "jpeg", "png", "tif", "tiff", "pdf"),
+            )
+            return
+
         dlg = wx.FileDialog(
             self,
             "Choose a document to import",
@@ -4345,22 +5573,7 @@ class ScanBox(wx.Frame):
         )
         try:
             if dlg.ShowModal() == wx.ID_OK:
-                source = dlg.GetPath()
-                self.app_settings["last_import_dir"] = os.path.dirname(source)
-                write_app_settings(self.app_settings)
-                try:
-                    if os.path.splitext(source)[1].lower() == ".pdf":
-                        self.process_pdf(source)
-                    else:
-                        path = self.copy_imported_image(source)
-                        self.process_image(
-                            path, False, "import", library_path=source
-                        )
-                except Exception as exc:
-                    wx.MessageBox(
-                        f"ScanBox could not import this file: {exc}",
-                        "Import failed",
-                    )
+                complete(dlg.GetPath())
         finally:
             dlg.Destroy()
 
@@ -4368,15 +5581,25 @@ class ScanBox(wx.Frame):
         if self.photo_mode_blocked(True):
             return
         self.last_active_mode = "photo"
+        last_dir = self.app_settings.get("last_import_dir")
+        batch_dir = last_dir if last_dir and os.path.isdir(last_dir) else (
+            os.path.expanduser("~") if sys.platform == "darwin" else IMAGES_DIR
+        )
+        if sys.platform == "darwin":
+            choose_macos_files_async(
+                self,
+                "Choose photos for batch import",
+                batch_dir,
+                self._show_batch_import_dialog,
+                multiple=True,
+                extensions=("jpg", "jpeg", "png", "tif", "tiff"),
+            )
+            return
+
         picker = wx.FileDialog(
             self,
             "Choose photos for batch import",
-            defaultDir=(
-                self.app_settings.get("last_import_dir")
-                if self.app_settings.get("last_import_dir")
-                and os.path.isdir(self.app_settings.get("last_import_dir"))
-                else IMAGES_DIR
-            ),
+            defaultDir=batch_dir,
             wildcard="Images (*.jpg;*.jpeg;*.png;*.tif;*.tiff)|*.jpg;*.jpeg;*.png;*.tif;*.tiff",
             style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE,
         )
@@ -4384,13 +5607,15 @@ class ScanBox(wx.Frame):
             if picker.ShowModal() != wx.ID_OK:
                 return
             paths = picker.GetPaths()
-            if paths:
-                self.app_settings["last_import_dir"] = os.path.dirname(paths[0])
-                write_app_settings(self.app_settings)
         finally:
             picker.Destroy()
+        self._show_batch_import_dialog(paths)
+
+    def _show_batch_import_dialog(self, paths):
         if not paths:
             return
+        self.app_settings["last_import_dir"] = os.path.dirname(paths[0])
+        write_app_settings(self.app_settings)
 
         dialog = wx.Dialog(self, title="Select photos to import")
         checklist = wx.ListCtrl(
@@ -4414,33 +5639,49 @@ class ScanBox(wx.Frame):
         checklist.Bind(wx.EVT_LIST_ITEM_CHECKED, on_batch_check)
         add_more = wx.Button(dialog, label="Add more photos...")
 
+        def append_more_paths(more_paths):
+            if more_paths:
+                self.app_settings["last_import_dir"] = os.path.dirname(more_paths[0])
+                write_app_settings(self.app_settings)
+            for path in more_paths:
+                if path not in paths:
+                    paths.append(path)
+                    index = checklist.InsertItem(
+                        checklist.GetItemCount(), os.path.basename(path)
+                    )
+                    checklist.CheckItem(index, True)
+
         def add_more_photos(event):
+            more_dir = (
+                self.app_settings.get("last_import_dir")
+                if self.app_settings.get("last_import_dir")
+                and os.path.isdir(self.app_settings.get("last_import_dir"))
+                else (
+                    os.path.expanduser("~") if sys.platform == "darwin" else IMAGES_DIR
+                )
+            )
+            if sys.platform == "darwin":
+                choose_macos_files_async(
+                    dialog,
+                    "Add photos",
+                    more_dir,
+                    append_more_paths,
+                    multiple=True,
+                    extensions=("jpg", "jpeg", "png", "tif", "tiff"),
+                )
+                return
+
             more_picker = wx.FileDialog(
                 dialog,
                 "Add photos",
-                defaultDir=(
-                    self.app_settings.get("last_import_dir")
-                    if self.app_settings.get("last_import_dir")
-                    and os.path.isdir(self.app_settings.get("last_import_dir"))
-                    else IMAGES_DIR
-                ),
+                defaultDir=more_dir,
                 wildcard="Images (*.jpg;*.jpeg;*.png;*.tif;*.tiff)|*.jpg;*.jpeg;*.png;*.tif;*.tiff",
                 style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST | wx.FD_MULTIPLE,
             )
             try:
                 if more_picker.ShowModal() != wx.ID_OK:
                     return
-                more_paths = more_picker.GetPaths()
-                if more_paths:
-                    self.app_settings["last_import_dir"] = os.path.dirname(more_paths[0])
-                    write_app_settings(self.app_settings)
-                for path in more_paths:
-                    if path not in paths:
-                        paths.append(path)
-                        index = checklist.InsertItem(
-                            checklist.GetItemCount(), os.path.basename(path)
-                        )
-                        checklist.CheckItem(index, True)
+                append_more_paths(more_picker.GetPaths())
             finally:
                 more_picker.Destroy()
 
@@ -4561,11 +5802,20 @@ class ScanBox(wx.Frame):
                 "a PDF."
             )
         use_ocr = self.app_settings.get("use_ocr_enabled", False)
-        if fitz is None:
+        if fitz is None and sys.platform != "darwin":
             raise ValueError("PDF page reading support is not installed in ScanBox.")
 
         self.prepare_output_buffer()
-        self.begin_busy("Please wait.", restore_focus=False)
+        # Only called from Import. On Windows the file dialog is an
+        # in-process wx.FileDialog that never hands focus away, so
+        # restore_focus=False avoids a redundant, announcement-clipping
+        # re-focus. On macOS the picker is a separate native helper process
+        # (see macos_choose_files) that genuinely takes foreground app
+        # status - without restoring focus here, it can be left stuck on
+        # whatever app was active before the picker (e.g. the Terminal
+        # window a test build was launched from), with no obvious way back
+        # to ScanBox for a screen reader user.
+        self.begin_busy("Please wait.", restore_focus=sys.platform == "darwin")
         threading.Thread(
             target=self._process_pdf_worker,
             args=(source, open_word),
@@ -4627,6 +5877,8 @@ class ScanBox(wx.Frame):
 
     def read_pdf_pages(self, source):
         """Return local text for each PDF page, invoking AI only when needed."""
+        if sys.platform == "darwin":
+            return self.read_pdf_pages_macos(source, use_ocr=False)
         pages = []
         with fitz.open(source) as pdf:
             if pdf.page_count == 0:
@@ -4653,6 +5905,8 @@ class ScanBox(wx.Frame):
 
     def read_pdf_pages_with_native_ocr(self, source):
         """Read scanned pages with Windows OCR or Apple Vision."""
+        if sys.platform == "darwin":
+            return self.read_pdf_pages_macos(source, use_ocr=True)
         pages = []
         with fitz.open(source) as pdf:
             if pdf.page_count == 0:
@@ -4676,6 +5930,35 @@ class ScanBox(wx.Frame):
                     engine_name = "Apple Vision" if sys.platform == "darwin" else "Windows OCR"
                     text = f"This page could not be read by {engine_name}."
                 pages.append(text)
+        return pages
+
+    def read_pdf_pages_macos(self, source, use_ocr=False):
+        """Read PDF pages with PDFKit and, when requested, Apple Vision."""
+        result = subprocess.run(
+            [
+                MACOS_CAPTURE_HELPER,
+                "read-pdf",
+                source,
+                "ocr" if use_ocr else "text",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+        )
+        pages = []
+        for line in result.stdout.splitlines():
+            kind, separator, encoded = line.partition("\t")
+            if kind != "page" or not separator:
+                continue
+            text = base64.b64decode(encoded).decode("utf-8", errors="replace").strip()
+            if not text:
+                text = "This page could not be read by Apple Vision."
+            pages.append(text)
+        if not pages:
+            raise ValueError("the PDF contains no pages.")
         return pages
 
     def write_pdf_pages_to_docx(self, source, pages):
@@ -4826,9 +6109,14 @@ class ScanBox(wx.Frame):
         self.session_file_sources.append(source_kind)
         self.session_file_modes.append("photo" if is_photo_mode else "document")
 
+        # source_kind == "import" skips the re-focus on Windows, where the
+        # file dialog is in-process and never hands focus away. macOS's
+        # Import uses a separate native picker process that does take
+        # foreground app status (see macos_choose_files / process_pdf
+        # above), so it still needs restore_focus there.
         self.begin_busy(
             "" if source_kind == "camera" else "Please wait.",
-            restore_focus=source_kind != "import",
+            restore_focus=source_kind != "import" or sys.platform == "darwin",
         )
         if is_photo_mode:
             self.photo_cancel_event = threading.Event()
@@ -4861,7 +6149,11 @@ class ScanBox(wx.Frame):
             if is_photo_mode:
                 text = self.process_photo(path, cancel_event=cancel_event)
             else:
-                text = self.process_document(path, allow_install_prompt=False)
+                text = self.process_document(
+                    path,
+                    allow_install_prompt=False,
+                    page_number=page_number,
+                )
         except Exception as exc:
             logger.exception("Image processing failed for %s", path)
             text = f"Processing failed: {exc}"
@@ -4932,7 +6224,7 @@ class ScanBox(wx.Frame):
             wx.CallAfter(completion, text)
 
     def process_document(
-        self, path, allow_install_prompt=True, detect_page=True,
+        self, path, allow_install_prompt=True, detect_page=True, page_number=None,
     ):
         # Camera-based captures (a document camera, or a handheld/desktop
         # scanner like a Pearl/IRIScan-style device) photograph the page
@@ -4972,7 +6264,7 @@ class ScanBox(wx.Frame):
         if self.offer_install_vision(
             "This document could not be read reliably. The local AI pack can "
             "provide a better reading.",
-            "florence_base",
+            DEFAULT_VISION_MODEL_ID,
         ):
             return (
                 "The local AI pack is being installed. Scan or import this page "
@@ -5002,9 +6294,12 @@ class ScanBox(wx.Frame):
         # confidently misjudged its own orientation. There's no dependable
         # way to detect this with a model this size, so it isn't attempted.
 
-        model_id = self.app_settings.get("vision_model", "florence_base")
         recognised_text = ""
-        if include_ocr and model_id == "qwen3_vl_2b" and sys.platform in {"win32", "darwin"}:
+        # Native OCR (Windows.Media.Ocr / Apple Vision) is a separate,
+        # model-independent pipeline - it has no dependency on which local
+        # AI describes the photo, so it's worth running alongside either
+        # model rather than only alongside Qwen3-VL.
+        if include_ocr and sys.platform in {"win32", "darwin"}:
             native_ocr = windows_ocr if sys.platform == "win32" else macos_ocr
             recognised_text = native_ocr(jpg_path).strip()
             recognised_words = re.findall(r"[A-Za-z0-9]+", recognised_text)
@@ -5126,6 +6421,32 @@ class ScanBox(wx.Frame):
         general_panel.SetSizer(general_sizer)
         notebook.AddPage(general_panel, "General")
 
+        if sys.platform == "darwin":
+            permissions_panel = wx.Panel(notebook)
+            _set_named_page_accessible(permissions_panel, "Permissions")
+            permissions_sizer = wx.BoxSizer(wx.VERTICAL)
+            permissions_help = wx.StaticText(
+                permissions_panel,
+                label=(
+                    "Open ScanBox's Mac permissions guide. Use this if "
+                    "screen description, global shortcuts or camera capture "
+                    "are not working."
+                ),
+            )
+            permissions_help.Wrap(480)
+            open_permissions_btn = wx.Button(
+                permissions_panel, label="Open Mac Permissions"
+            )
+            open_permissions_btn.Bind(wx.EVT_BUTTON, self.show_macos_permissions)
+            permissions_sizer.Add(
+                permissions_help, 0, wx.ALL | wx.EXPAND, 10
+            )
+            permissions_sizer.Add(
+                open_permissions_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10
+            )
+            permissions_panel.SetSizer(permissions_sizer)
+            notebook.AddPage(permissions_panel, "Permissions")
+
         camera_panel = wx.Panel(notebook)
         _set_named_page_accessible(camera_panel, "Camera")
         camera_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -5220,7 +6541,7 @@ class ScanBox(wx.Frame):
             )
         model_choice = wx.Choice(ai_panel, choices=model_labels)
         model_choice.SetName("Image description model")
-        current_model = self.app_settings.get("vision_model", "florence_base")
+        current_model = self.app_settings.get("vision_model", DEFAULT_VISION_MODEL_ID)
         model_choice.SetSelection(model_ids.index(current_model) if current_model in model_ids else 0)
         ai_sizer.Add(wx.StaticText(ai_panel, label="Image description model"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
         ai_sizer.Add(model_choice, 0, wx.ALL | wx.EXPAND, 10)
@@ -5228,6 +6549,13 @@ class ScanBox(wx.Frame):
         install_ai_btn = wx.Button(ai_panel, label="Install or update local AI model")
         cancel_install_btn = wx.Button(ai_panel, label="Cancel AI Download")
         delete_model_btn = wx.Button(ai_panel, label="Delete local AI model")
+        install_status = wx.StaticText(ai_panel, label="")
+        install_status.SetName("AI download status")
+        install_progress = wx.Gauge(ai_panel, range=100)
+        install_status.Hide()
+        install_progress.Hide()
+        self._ai_install_status = install_status
+        self._ai_install_progress = install_progress
 
         def model_is_installed(model_id):
             model = VISION_MODELS[model_id]
@@ -5277,6 +6605,10 @@ class ScanBox(wx.Frame):
                 cancel_install_btn.Show(True)
                 cancel_install_btn.Enable(True)
                 delete_model_btn.Enable(False)
+                install_status.SetLabel("Downloading model…")
+                install_progress.SetValue(0)
+                install_status.Show()
+                install_progress.Show()
                 ai_panel.Layout()
 
         def on_delete_model(event):
@@ -5320,6 +6652,8 @@ class ScanBox(wx.Frame):
         model_choice.Bind(wx.EVT_CHOICE, lambda event: refresh_model_controls())
         ai_sizer.Add(install_ai_btn, 0, wx.ALL, 10)
         ai_sizer.Add(cancel_install_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        ai_sizer.Add(install_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        ai_sizer.Add(install_progress, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 10)
         ai_sizer.Add(delete_model_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         ai_panel.SetSizer(ai_sizer)
         notebook.AddPage(ai_panel, "AI")
@@ -5400,7 +6734,7 @@ class ScanBox(wx.Frame):
                 if event.CanVeto():
                     event.Veto()
                     return
-            if self.busy:
+            if self.busy or self.image_export_active:
                 wx.MessageBox(
                     "ScanBox is still processing. Please "
                     "wait for it to finish before closing so temporary input files "
@@ -5419,7 +6753,7 @@ class ScanBox(wx.Frame):
             self.camera_alignment_active = False
             self.close_facealign_dialog()
             announce("Exiting.")
-            if event.CanVeto():
+            if sys.platform != "darwin" and event.CanVeto():
                 self._close_after_announcement = True
                 event.Veto()
                 wx.CallLater(500, self.Close)
@@ -5456,6 +6790,12 @@ class ScanBox(wx.Frame):
             _mac_announce_process = None
             try:
                 self._mac_helper_process.terminate()
+                self._mac_helper_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._mac_helper_process.kill()
+                except Exception:
+                    pass
             except Exception:
                 pass
             self._mac_helper_process = None
@@ -5463,6 +6803,15 @@ class ScanBox(wx.Frame):
             self.tray_icon.RemoveIcon()
             self.tray_icon.Destroy()
             self.tray_icon = None
+        if sys.platform == "darwin":
+            logger.info("macOS close cleanup finished; exiting process")
+            logging.shutdown()
+            try:
+                self.Destroy()
+            except Exception:
+                pass
+            os._exit(0)
+            return
         event.Skip()
 
     def delete_created_output_files(self):
@@ -5553,7 +6902,8 @@ class ScanBox(wx.Frame):
             try:
                 if dlg.ShowModal() == wx.ID_OK:
                     destination = self.write_scanned_jpeg(
-                        scanned_paths[0], dlg.GetPath()
+                        scanned_paths[0],
+                        dlg.GetPath(),
                     )
                     if active_mode == "photo":
                         description = self.session_photo_descriptions.get(
@@ -5616,22 +6966,62 @@ class ScanBox(wx.Frame):
                 return candidate
         return os.path.join(folder, f"{stem} {uuid.uuid4().hex}{extension}")
 
-    def write_scanned_jpeg(self, source, destination):
+    def write_scanned_jpeg(self, source, destination, rotation=None):
         stem, extension = os.path.splitext(destination)
         if extension.lower() not in {".jpg", ".jpeg"}:
             destination = (stem if extension else destination) + ".jpg"
         with Image.open(source) as img:
-            ImageOps.exif_transpose(img).convert("RGB").save(
+            img = ImageOps.exif_transpose(img)
+            transpose = {
+                90: Image.Transpose.ROTATE_270,
+                180: Image.Transpose.ROTATE_180,
+                270: Image.Transpose.ROTATE_90,
+            }.get(rotation)
+            if transpose is not None:
+                img = img.transpose(transpose)
+            img.convert("RGB").save(
                 destination, "JPEG", quality=95
             )
+        return destination
+
+    def write_scanned_image_pdf(self, sources, destination, rotations=None):
+        stem, extension = os.path.splitext(destination)
+        if extension.lower() != ".pdf":
+            destination = (stem if extension else destination) + ".pdf"
+        rotations = rotations or {}
+        pages = []
+        try:
+            for source in sources:
+                with Image.open(source) as img:
+                    img = ImageOps.exif_transpose(img)
+                    transpose = {
+                        90: Image.Transpose.ROTATE_270,
+                        180: Image.Transpose.ROTATE_180,
+                        270: Image.Transpose.ROTATE_90,
+                    }.get(rotations.get(source, 0))
+                    if transpose is not None:
+                        img = img.transpose(transpose)
+                    pages.append(img.convert("RGB"))
+            if not pages:
+                raise ValueError("No scanned pages were available to save.")
+            pages[0].save(
+                destination,
+                "PDF",
+                save_all=True,
+                append_images=pages[1:],
+                resolution=300.0,
+            )
+        finally:
+            for page in pages:
+                page.close()
         return destination
 
     def install_local_ai(self, event):
         if self.installing:
             wx.MessageBox("The local AI model is already downloading.", "ScanBox")
             return
-        model_id = self.app_settings.get("vision_model", "florence_base")
-        model_name = VISION_MODELS.get(model_id, VISION_MODELS["florence_base"])["name"]
+        model_id = self.app_settings.get("vision_model", DEFAULT_VISION_MODEL_ID)
+        model_name = VISION_MODELS.get(model_id, VISION_MODELS[DEFAULT_VISION_MODEL_ID])["name"]
         if wx.MessageBox(
             f"Install {model_name} for local image descriptions? Images remain "
             "on this computer.",
@@ -5646,8 +7036,8 @@ class ScanBox(wx.Frame):
         Returns True if a download was started (or is already running)."""
         if self.installing:
             return True
-        selected_id = model_id or self.app_settings.get("vision_model", "florence_base")
-        selected_model = VISION_MODELS.get(selected_id, VISION_MODELS["florence_base"])
+        selected_id = model_id or self.app_settings.get("vision_model", DEFAULT_VISION_MODEL_ID)
+        selected_model = VISION_MODELS.get(selected_id, VISION_MODELS[DEFAULT_VISION_MODEL_ID])
         if wx.MessageBox(
             reason + f" ScanBox is about to download {selected_model['name']}. "
             "Install it now? Processing remains on this computer.",
@@ -5664,7 +7054,7 @@ class ScanBox(wx.Frame):
         self.installing = True
         self.install_cancel_event = threading.Event()
         self._installing_model_id = model_id or self.app_settings.get(
-            "vision_model", "florence_base"
+            "vision_model", DEFAULT_VISION_MODEL_ID
         )
         self.install_gauge.SetValue(0)
         self.install_gauge.Show()
@@ -5714,6 +7104,19 @@ class ScanBox(wx.Frame):
         else:
             self.install_gauge.Pulse()
         self.SetStatusText(message)
+        status = getattr(self, "_ai_install_status", None)
+        progress_control = getattr(self, "_ai_install_progress", None)
+        try:
+            if status is not None:
+                status.SetLabel(message)
+            if progress_control is not None:
+                if progress:
+                    progress_control.SetValue(percentage)
+                else:
+                    progress_control.Pulse()
+        except RuntimeError:
+            self._ai_install_status = None
+            self._ai_install_progress = None
         announce(message)
 
     def _install_done(self, result):
@@ -5735,6 +7138,16 @@ class ScanBox(wx.Frame):
             except RuntimeError:
                 self._refresh_ai_model_controls = None
         self.SetStatusText(result)
+        status = getattr(self, "_ai_install_status", None)
+        progress_control = getattr(self, "_ai_install_progress", None)
+        try:
+            if status is not None:
+                status.SetLabel(result)
+            if progress_control is not None:
+                progress_control.SetValue(100 if result.startswith("Local AI pack installed") else 0)
+        except RuntimeError:
+            self._ai_install_status = None
+            self._ai_install_progress = None
         announce(result)
         if (
             result.startswith("Local AI pack installed")
@@ -5852,9 +7265,36 @@ def main():
         return
 
     app = wx.App(False)
+    app.SetExitOnFrameDelete(True)
     frame = ScanBox()
     frame.Show()
-    app.MainLoop()
+    if sys.platform == "darwin":
+        _macos_activate_self()
+    try:
+        app.MainLoop()
+    finally:
+        stop_mtmd_server()
+
+
+def _macos_activate_self():
+    """Force ScanBox to become the frontmost/active application.
+
+    Double-clicking an app in Finder, or launching it with `open`, makes
+    macOS activate it automatically. A bare executable started directly
+    from a shell - as test_macos.sh does with `nohup` - does not get that
+    same automatic activation, so keyboard focus (and with it, things like
+    Cmd+Q) can silently stay with whichever app launched it instead, even
+    though ScanBox's window is visibly on screen. This asks macOS directly
+    to make ScanBox the active app, regardless of how it was started.
+    """
+    if NSRunningApplication is None:
+        return
+    try:
+        NSRunningApplication.currentApplication().activateWithOptions_(
+            NSApplicationActivateIgnoringOtherApps
+        )
+    except Exception:
+        logger.exception("Could not activate ScanBox")
 
 
 if __name__ == "__main__":

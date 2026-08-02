@@ -1,0 +1,46 @@
+{
+  "name": "ScanBox local vision pack (Florence-2-base for macOS)",
+  "subdir": "florence2-base",
+  "notes": [
+    "FP16 ONNX weights, approximately 780 MB total. INT8 was tried first",
+    "to match Windows exactly, but ONNX Runtime's Apple Silicon CPU",
+    "provider has no kernel for the ConvInteger op INT8-quantized conv",
+    "layers use, so it fails to load entirely. FP16 uses ordinary",
+    "float math instead of integer quantization, so it loads correctly",
+    "and stays much closer to full quality than INT8 or Q4F16.",
+    "Uses decoder_model_merged_fp16.onnx for cached, incremental",
+    "decoding - the same graph architecture Windows uses for its INT8",
+    "pack. decoder_with_past_model_fp16.onnx was tried first since it",
+    "looked like a safer bet, but it turned out to be statically exported",
+    "for a fixed 16-token window and rejects normal one-token generation",
+    "at run time. The merged graph (which switches between first-pass and",
+    "cached decoding via a use_cache_branch flag) is dynamically shaped",
+    "and loads/runs correctly."
+  ],
+  "files": [
+    {
+      "name": "vision_encoder_fp16.onnx",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/onnx/vision_encoder_fp16.onnx"
+    },
+    {
+      "name": "embed_tokens_fp16.onnx",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/onnx/embed_tokens_fp16.onnx"
+    },
+    {
+      "name": "encoder_model_fp16.onnx",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/onnx/encoder_model_fp16.onnx"
+    },
+    {
+      "name": "decoder_model_fp16.onnx",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/onnx/decoder_model_fp16.onnx"
+    },
+    {
+      "name": "decoder_model_merged_fp16.onnx",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/onnx/decoder_model_merged_fp16.onnx"
+    },
+    {
+      "name": "tokenizer.json",
+      "url": "https://huggingface.co/onnx-community/Florence-2-base/resolve/main/tokenizer.json"
+    }
+  ]
+}

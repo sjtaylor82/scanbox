@@ -32,7 +32,7 @@ services are being replaced incrementally on the `macos-port` branch.
 - Default file and folder opening supports Finder.
 - PDF-to-Word capability is disabled outside Windows.
 - Windows WIA scanning remains unchanged.
-- On macOS, Scan Document discovers ImageCaptureCore scanners, lets the user
+- On macOS, the document scanning workflows discover ImageCaptureCore scanners, let the user
   select one when necessary, selects its flatbed, and returns the scanned file
   to the existing OCR pipeline. Camera capture remains a separate workflow.
 - The Mac port follows the shared Scan, Import, and Photo Library tab layout.
