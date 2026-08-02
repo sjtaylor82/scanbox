@@ -2814,7 +2814,7 @@ class ScanBox(wx.Frame):
         self.mode_tabs = wx.Notebook(panel)
 
         # Scan tab - capture straight from a camera/scanner.
-        self.scan_panel = wx.Panel(self.mode_tabs)
+        self.scan_panel = wx.Panel(self.mode_tabs, style=wx.TAB_TRAVERSAL)
         _set_named_page_accessible(self.scan_panel, "Scan")
         scan_sizer = wx.WrapSizer(wx.HORIZONTAL)
         self.document_scan_btn = wx.Button(
@@ -2847,6 +2847,11 @@ class ScanBox(wx.Frame):
         self.camera_alignment_btn = wx.Button(
             self.scan_panel, label="FaceAlign"
         )
+        # Keep the two document workflows adjacent in the native keyboard
+        # navigation order. Cocoa can otherwise derive a different order
+        # from the wrapped visual layout after controls are added or resized.
+        self.scan_save_images_btn.MoveAfterInTabOrder(self.document_scan_btn)
+        self.document_camera_btn.MoveAfterInTabOrder(self.scan_save_images_btn)
         scan_sizer.Add(self.document_scan_btn, 0, wx.ALL, 6)
         scan_sizer.Add(self.scan_save_images_btn, 0, wx.ALL, 6)
         scan_sizer.Add(self.document_camera_btn, 0, wx.ALL, 6)
@@ -3468,6 +3473,11 @@ class ScanBox(wx.Frame):
             self.refresh_photo_library()
         self.update_controls()
         event.Skip()
+
+    def focus_scan_tab_on_startup(self):
+        """Give macOS a stable, screen-reader-friendly entry point."""
+        self.mode_tabs.SetSelection(self.TAB_SCAN)
+        self.mode_tabs.SetFocus()
 
     def on_activate(self, event):
         # Windows already restores keyboard focus to whatever control last
@@ -7270,6 +7280,7 @@ def main():
     frame.Show()
     if sys.platform == "darwin":
         _macos_activate_self()
+        wx.CallAfter(frame.focus_scan_tab_on_startup)
     try:
         app.MainLoop()
     finally:
