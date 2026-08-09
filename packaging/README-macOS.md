@@ -6,7 +6,7 @@ later.
 
 For a complete local test build, run:
 
-`bash packaging/test_macos.sh`
+`bash test_macos.sh`
 
 The script creates an isolated environment, installs build dependencies,
 builds and checks the app, prints the manual test sequence, and opens ScanBox.

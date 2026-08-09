@@ -25,3 +25,11 @@ build/
 dist/
 *.spec
 !packaging/ScanBox-macOS.spec
+
+# Local macOS build and test artifacts
+.DS_Store
+.venv-macos-test/
+macos-build.log
+macos-pip-install.log
+scanbox-macos-startup.log
+scanbox-macos.log

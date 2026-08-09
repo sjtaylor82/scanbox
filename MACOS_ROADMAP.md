@@ -59,6 +59,6 @@ services are being replaced incrementally on the `macos-port` branch.
   outstanding.
 - ImageCaptureCore scanner hardware testing, signing, and notarisation remain
   outstanding.
-- `packaging/test_macos.sh` produces a repeatable local test build, verifies
+- `test_macos.sh` produces a repeatable local test build, verifies
   the helper, FaceAlign data, shutter sound, and permission metadata, then
   opens the app with a focused manual test checklist.

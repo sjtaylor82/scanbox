@@ -1,11 +1,12 @@
 ScanBox
 =======
 
-ScanBox is a privacy-first scanning, recognition and image description app
-for Windows, with an in-progress macOS port.
+ScanBox 2026.8.0 is a privacy-first scanning, recognition, and image-description
+app for 64-bit Windows 10 and 11. A macOS 14-or-later test preview is also
+available.
 Documents, photographs, screenshots, OCR results, and AI descriptions are
 processed locally under the standard configuration rather than being sent to
-a cloud service. ScanBox may use the internet to check GitHub for application
+a cloud service. ScanBox uses the internet to check GitHub for application
 updates and to download optional local AI model files.
 
 Tabs
@@ -36,13 +37,16 @@ Tabs
      is preferred
 
 3. Photo Library
-   - browse previously described photos, see the stored description, and open,
-     locate, or copy the path of the original file
+   - browse previously described photos and see the stored description
+   - open the original, open its containing folder, copy its path, ask the
+     installed model a follow-up question, or remove the stored description
 
 What you need
 -------------
 
-  Windows 10 or 11 (64-bit). macOS 14 or later is currently a test preview.
+  Windows 10 or 11 (64-bit). macOS 14 or later is currently a test preview;
+  signing, notarisation, and final hardware and VoiceOver testing remain
+  release work.
 
   Windows scanner capture uses Windows Image Acquisition (WIA), so a scanner
   with a WIA driver works. USB/UVC cameras use OpenCV's Windows camera backend
@@ -54,8 +58,9 @@ What you need
   Camera descriptions remain temporary until the captured images are saved;
   only then are the saved paths and descriptions added to the Photo Library.
 
-  On macOS, Scan and Read Document and Scan and Save Images discover conventional scanners through
-  ImageCaptureCore and scans from the selected flatbed directly into ScanBox.
+  On macOS, Scan and Read Document and Scan and Save Images discover
+  conventional scanners through ImageCaptureCore and scan from the selected
+  device directly into ScanBox.
   Camera capture remains separate. Allow ScanBox camera access in System
   Settings > Privacy & Security > Camera when using a camera.
 
@@ -66,10 +71,9 @@ What you need
   Control+backslash describes the frontmost application's foremost window,
   Control+Shift+backslash reads its text, Control+Shift+/ asks Qwen a question
   about it, and Control+Option+backslash toggles ScanBox. macOS requires Screen
-  Recording permission under System Settings >
-  Privacy & Security for window capture; native shortcut registration does
-  not require Accessibility permission. Reopen ScanBox after granting Screen
-  Recording permission.
+  Recording permission under System Settings > Privacy & Security for window
+  capture; native shortcut registration does not require Accessibility
+  permission. Reopen ScanBox after granting Screen Recording permission.
 
   Text recognition uses Windows OCR on Windows and Apple Vision on macOS. The
   optional local vision model is downloaded on demand (see below).
@@ -84,16 +88,19 @@ Easiest setup: open Settings (Ctrl+Comma on Windows or Command+Comma on macOS),
 go to the AI tab, choose an image-description model, then choose "Install or
 update local AI model". ScanBox downloads and configures it in the background.
 
-Recommended model (built in)
-----------------------------
+Available models
+----------------
 
-  ScanBox includes two local choices: the smaller, quicker Florence-2 Base
-  (about 355 MB), and the larger, more accurate Qwen3-VL 2B (about 2.28 GB).
-  Settings identifies which models are
-  installed. Photo descriptions include the selected model name and
-  processing time to support fair testing.
-  Florence-2 Base remains the difficult-document transcription fallback; the
-  model choice changes image descriptions only.
+  Windows offers two local choices: the smaller, quicker Florence-2 Base
+  (about 355 MB) and the larger, more accurate Qwen3-VL 2B (about 2.28 GB).
+  The current macOS preview offers Qwen3-VL 2B only. Settings identifies which
+  models are installed. Photo descriptions include the selected model name
+  and processing time to support fair testing.
+
+  On Windows, Florence-2 Base remains the difficult-document transcription
+  fallback; the selected model changes image descriptions only. macOS uses
+  Apple Vision for native OCR and Qwen for local visual description and
+  questions.
   On Windows and macOS, substantial native OCR is shown separately beneath the
   description. It is not supplied to Qwen, so imperfect OCR cannot influence
   the visual description.
@@ -118,12 +125,30 @@ by default and can be enabled in Settings.
 How install works
 ------------------
 
-The Install Local AI button downloads the description model selected in Settings. Qwen3-VL
-also receives ScanBox's private local multimodal runner. Windows prefers the
-hardware-accelerated Vulkan runner and retains a CPU fallback; macOS uses the
-native runner. Users
-are not asked to configure commands or executable paths. For
-distribution you can also ship engines\vision already populated.
+The Install or update local AI model button downloads the model selected in
+Settings. Qwen3-VL also receives ScanBox's private local multimodal runner.
+Windows prefers the hardware-accelerated Vulkan runner and retains a CPU
+fallback; macOS uses the native runner. Users are not asked to configure
+commands or executable paths. A distribution can also ship `engines\vision`
+already populated.
+
+Running from source
+-------------------
+
+Use a 64-bit Python environment. On Windows, install `requirements.txt`, then
+run:
+
+  python scanbox.py
+
+On macOS, install `requirements-macos.txt`. The native helper and application
+bundle must be built on a Mac with Xcode command-line tools available:
+
+  python packaging/build_macos.py
+
+For the existing macOS test environment, `bash test_macos.sh` installs updated
+requirements, rebuilds when inputs have changed, and opens the cached app
+bundle. See `packaging/README-macOS.md` for platform testing and distribution
+requirements.
 
 Where your files live
 ----------------------
@@ -141,8 +166,9 @@ For a packaged macOS build, per-user state is stored in:
 
   ~/Library/Application Support/ScanBox
 
-Bundled, read-only parts (the screen-reader support file, the PDF-to-Word
-engine, and any pre-shipped vision pack) always stay in the install folder.
+Bundled, read-only resources and any pre-shipped vision pack always stay in
+the install folder. Windows distributions may additionally bundle screen-reader
+support and the PDF-to-Word engine.
 
 Screen reader support
 ---------------------
@@ -156,10 +182,11 @@ by default so the results area has plenty of room to read.
 PDF reading and Word
 --------------------
 
-When "Create a DOCX and open it in Microsoft Word" is selected, PDFs with
-selectable text use the bundled PDF2Word engine. Scanned PDFs are read page by
-page with Windows OCR and written to a DOCX. The setting is disabled when
-Microsoft Word cannot be found.
+On Windows, when "Create a DOCX and open it in Microsoft Word" is selected,
+PDFs with selectable text use the bundled PDF2Word engine. Scanned PDFs are
+read page by page with Windows OCR and written to a DOCX. The choice is
+disabled when Microsoft Word cannot be found. PDF-to-Word is not available in
+the current macOS preview.
 
 When "Show PDF reading in ScanBox" is selected, ScanBox does not create a DOCX. Selectable
 PDF text is extracted directly; scanned pages use native operating-system OCR.
@@ -169,6 +196,7 @@ Model manifests
 ---------------
 
   config\vision_pack_florence2_base.json
+  config\vision_pack_florence2_base_macos.json
   config\vision_pack_qwen3_vl_2b.json
 
 Privacy
@@ -176,8 +204,9 @@ Privacy
 
 Document scanning, OCR, screen analysis, and photograph description are
 performed on this computer. Florence-2 runs locally in-process through ONNX
-Runtime. Windows document and screen OCR use Windows OCR. macOS document and
-screen OCR use Apple Vision.
+Runtime. Qwen3-VL runs through a private loopback service started and stopped
+by ScanBox. Windows document and screen OCR use Windows OCR. macOS document
+and screen OCR use Apple Vision.
 
 An internet connection is used in the following circumstances:
 

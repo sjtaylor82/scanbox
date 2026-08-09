@@ -6364,13 +6364,15 @@ class ScanBox(wx.Frame):
         _set_named_page_accessible(general_panel, "General")
         general_sizer = wx.BoxSizer(wx.VERTICAL)
         delete_output = wx.CheckBox(general_panel, label="Delete output files upon exit")
+        pdf_destination_choices = ["Show PDF reading in ScanBox"]
+        if sys.platform == "win32":
+            pdf_destination_choices.append(
+                "Create a DOCX and open it in Microsoft Word"
+            )
         pdf_destination = wx.RadioBox(
             general_panel,
             label="PDF reading destination",
-            choices=[
-                "Show PDF reading in ScanBox",
-                "Create a DOCX and open it in Microsoft Word",
-            ],
+            choices=pdf_destination_choices,
             majorDimension=1,
             style=wx.RA_SPECIFY_ROWS,
         )
@@ -6392,15 +6394,18 @@ class ScanBox(wx.Frame):
             f"Write scan, import, and local AI details to {LOG_FILE}"
         )
         delete_output.SetValue(self.app_settings.get("delete_output_files_on_exit", False))
-        word_available = microsoft_word_available()
+        word_available = (
+            sys.platform == "win32" and microsoft_word_available()
+        )
         pdf_destination.SetSelection(
             1
             if word_available
             and self.app_settings.get("open_word_after_pdf_conversion", False)
             else 0
         )
-        pdf_destination.EnableItem(1, word_available)
-        if not word_available:
+        if sys.platform == "win32":
+            pdf_destination.EnableItem(1, word_available)
+        if sys.platform == "win32" and not word_available:
             pdf_destination.SetToolTip(
                 "Microsoft Word was not found; PDF readings will be shown in ScanBox."
             )
