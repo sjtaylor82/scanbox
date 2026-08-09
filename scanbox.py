@@ -26,7 +26,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 from get_active_tab_url import (
     ActiveTabUrlError,
+    download_active_browser_document_windows,
     get_active_tab_url,
+    is_session_bound_download_url,
+    make_browser_download_request,
+    open_with_browser_session,
+    save_active_browser_document_windows,
     warm_up_active_tab_url_reader,
 )
 
@@ -3839,9 +3844,60 @@ class ScanBox(wx.Frame):
     def _download_browser_pdf_worker(self, url):
         path = ""
         started = time.perf_counter()
+
+        def save_through_active_browser():
+            nonlocal path
+            path = os.path.join(
+                TEMP_DIR, f"Browser PDF {uuid.uuid4().hex}.pdf"
+            )
+            logger.info("Saving session-bound PDF through the active browser")
+            try:
+                download_active_browser_document_windows(path, timeout=30)
+            except Exception:
+                logger.exception(
+                    "Silent browser download was unavailable; using Save As"
+                )
+                save_active_browser_document_windows(path, timeout=30)
+            with open(path, "rb") as saved_pdf:
+                first = saved_pdf.read(8)
+                saved_pdf.seek(0, os.SEEK_END)
+                total = saved_pdf.tell()
+            if total > 100 * 1024 * 1024:
+                raise ValueError("The PDF is larger than ScanBox's 100 MB limit.")
+            if not first.startswith(b"%PDF-"):
+                raise ValueError("The browser did not save a valid PDF file.")
+            logger.info("Browser saved PDF bytes=%d", total)
+            wx.CallAfter(self._open_downloaded_browser_pdf, path)
+
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": f"ScanBox/{APP_VERSION}"})
-            with urllib.request.urlopen(request, timeout=30) as response:
+            if sys.platform == "win32" and is_session_bound_download_url(url):
+                save_through_active_browser()
+                return
+
+            request = make_browser_download_request(url)
+            try:
+                response = urllib.request.urlopen(request, timeout=30)
+            except urllib.error.HTTPError as exc:
+                failed_url = exc.geturl()
+                session_bound = (
+                    is_session_bound_download_url(url)
+                    or is_session_bound_download_url(failed_url)
+                )
+                if exc.code not in {401, 403, 404, 429}:
+                    raise
+                if sys.platform == "win32":
+                    logger.info(
+                        "Browser PDF request failed with HTTP %d; "
+                        "using the active browser",
+                        exc.code,
+                    )
+                    save_through_active_browser()
+                    return
+                if not session_bound:
+                    raise
+                logger.info("Retrying browser-session PDF with browser cookies")
+                response = open_with_browser_session(url, timeout=30)
+            with response:
                 final_url = response.geturl()
                 if not final_url.lower().startswith("https://"):
                     raise ValueError("The PDF redirected to a non-HTTPS address.")

@@ -4,6 +4,7 @@
 wxPython
 python-docx
 fpdf2
+browser-cookie3
 Pillow
 numpy
 coloredlogs
