@@ -21,3 +21,4 @@ onnxruntime              # Florence-2 local vision engine.
 tokenizers               # Florence-2 local vision engine.
 PyMuPDF                  # "fitz" import; PDF page reading.
 accessible_output2; sys_platform == "win32"  # NVDA/JAWS/System Access/SAPI.
+pywinauto; sys_platform == "win32"  # Read the active browser address without moving focus.

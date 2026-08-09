@@ -330,6 +330,7 @@ final class HotKeyService {
         try register(id: 2, keyCode: UInt32(kVK_ANSI_Backslash), modifiers: UInt32(controlKey | shiftKey))
         try register(id: 3, keyCode: UInt32(kVK_ANSI_Backslash), modifiers: UInt32(controlKey | optionKey))
         try register(id: 4, keyCode: UInt32(kVK_ANSI_Slash), modifiers: UInt32(controlKey | shiftKey))
+        try register(id: 5, keyCode: UInt32(kVK_ANSI_Minus), modifiers: UInt32(controlKey | shiftKey))
         emit("ready", "registered")
         startCommandReader()
     }
@@ -383,6 +384,10 @@ final class HotKeyService {
         emit("hotkey", "\(id)")
         if id == 3 {
             emit("toggle", "")
+            return
+        }
+        if id == 5 {
+            emit("browser-pdf", "")
             return
         }
         guard !captureInProgress else { return }

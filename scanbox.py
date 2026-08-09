@@ -17,10 +17,18 @@ import threading
 import time
 import urllib.request
 import urllib.error
+from urllib.parse import unquote, urlsplit
 import uuid
 import platform
 import zipfile
 import tarfile
+from concurrent.futures import ThreadPoolExecutor
+
+from get_active_tab_url import (
+    ActiveTabUrlError,
+    get_active_tab_url,
+    warm_up_active_tab_url_reader,
+)
 
 if sys.platform == "win32":
     import winreg
@@ -2645,6 +2653,38 @@ def xml_safe_text(text):
     return _INVALID_XML_TEXT.sub("", str(text))
 
 
+def suggested_document_filename(text, extension="txt"):
+    """Return a conservative, editable filename derived from local OCR."""
+    lines = [re.sub(r"\s+", " ", line).strip() for line in str(text).splitlines()]
+    lines = [line for line in lines if line]
+    lower = "\n".join(lines).lower()
+    kind = next((label for marker, label in (
+        ("receipt", "Receipt"), ("invoice", "Invoice"),
+        ("statement", "Statement"), ("bill", "Bill"), ("dear ", "Letter"),
+    ) if marker in lower), "Scanned document")
+    issuer = next((line for line in lines[:6] if 3 <= len(line) <= 60 and not
+                   re.search(r"\d{2,}|receipt|invoice|statement|bill", line, re.I)), "")
+    body = "\n".join(lines)
+    date_match = re.search(
+        r"\b(?:\d{1,2}[ /.-](?:\d{1,2}|[A-Za-z]{3,9})[ /.-]\d{2,4}|"
+        r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|[A-Za-z]{3,9}\s+\d{4})\b",
+        body, re.I,
+    )
+    total_match = re.search(r"\btotal\b[^\d$]{0,12}(\$?\s*\d+(?:[.,]\d{2})?)", body, re.I)
+    parts = [kind]
+    if kind != "Scanned document" and issuer and issuer.lower() != kind.lower():
+        parts.append(issuer)
+    if date_match:
+        parts.append(date_match.group(0))
+    if kind in {"Receipt", "Invoice", "Bill"} and total_match:
+        parts.append(total_match.group(1).replace(" ", ""))
+    stem = " - ".join(parts)
+    stem = "".join(c if c not in '<>:"/\\|?*' else "_" for c in stem).rstrip(" .")
+    stem = stem[:120] or "Scanned document"
+    extension = extension.lstrip(".")
+    return f"{stem}.{extension}" if extension else stem
+
+
 def save_text_output(text, path, fmt):
     if fmt == "txt":
         with open(path, "w", encoding="utf-8") as f:
@@ -2773,6 +2813,11 @@ class ScanBox(wx.Frame):
         self.image_export_multiple = False
         self.image_export_paths = []
         self.image_export_rotations = {}
+        self.browser_url_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="ScanBox browser accessibility",
+        )
+        self.browser_url_executor.submit(self._warm_browser_url_reader)
 
         menu_bar = wx.MenuBar()
         help_menu = wx.Menu()
@@ -3064,6 +3109,18 @@ class ScanBox(wx.Frame):
             wx.EVT_HOTKEY,
             self.on_screen_question_hotkey,
             id=self.screen_question_hotkey_id,
+        )
+        self.browser_pdf_hotkey_id = wx.NewIdRef()
+        if sys.platform == "win32" and not self.RegisterHotKey(
+            self.browser_pdf_hotkey_id,
+            wx.MOD_CONTROL | wx.MOD_SHIFT,
+            0xBD,  # VK_OEM_MINUS
+        ):
+            logger.warning("Could not register global Ctrl+Shift+hyphen hotkey")
+        self.Bind(
+            wx.EVT_HOTKEY,
+            self.on_browser_pdf_hotkey,
+            id=self.browser_pdf_hotkey_id,
         )
         self.toggle_window_hotkey_id = wx.NewIdRef()
         if sys.platform == "win32" and not self.RegisterHotKey(
@@ -3730,6 +3787,163 @@ class ScanBox(wx.Frame):
             return
         self._ask_screen_question(path, restore_window=restore_window)
 
+    def on_browser_pdf_hotkey(self, event=None):
+        """Import a public PDF exposed by the foreground browser tab."""
+        if self.busy:
+            return
+        self.busy = True
+        self.update_controls()
+        self.SetStatusText("Reading the current browser tab...")
+        announce("Please wait. Reading the current browser tab.")
+        self.browser_url_executor.submit(self._browser_pdf_url_worker)
+
+    @staticmethod
+    def _warm_browser_url_reader():
+        started = time.perf_counter()
+        try:
+            warm_up_active_tab_url_reader()
+            logger.info(
+                "Browser accessibility initialized in %.2f seconds",
+                time.perf_counter() - started,
+            )
+        except Exception:
+            logger.exception("Could not initialize browser accessibility")
+
+    def _browser_pdf_url_worker(self):
+        """Read browser UIA/AX state away from wx's existing COM apartment."""
+        started = time.perf_counter()
+        try:
+            url = get_active_tab_url()
+            if not url.lower().startswith("https://"):
+                raise ActiveTabUrlError(
+                    "Only HTTPS PDF addresses can be imported from a browser."
+                )
+        except Exception as exc:
+            logger.exception("Could not read the active browser URL")
+            wx.CallAfter(self._finish_browser_pdf_error, str(exc))
+            return
+        logger.info(
+            "Read active browser URL in %.2f seconds",
+            time.perf_counter() - started,
+        )
+        wx.CallAfter(
+            self.SetStatusText,
+            "Downloading PDF from the current browser tab...",
+        )
+        wx.CallAfter(
+            announce,
+            "Downloading PDF from the current browser tab. Please wait.",
+        )
+        self._download_browser_pdf_worker(url)
+
+    def _download_browser_pdf_worker(self, url):
+        path = ""
+        started = time.perf_counter()
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": f"ScanBox/{APP_VERSION}"})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                final_url = response.geturl()
+                if not final_url.lower().startswith("https://"):
+                    raise ValueError("The PDF redirected to a non-HTTPS address.")
+                supplied_name = response.headers.get_filename() or unquote(
+                    os.path.basename(urlsplit(final_url).path)
+                )
+                supplied_stem = os.path.splitext(supplied_name)[0]
+                safe_stem = "".join(
+                    character if character not in '<>:"/\\|?*' else "_"
+                    for character in supplied_stem.strip()
+                ).rstrip(" .")[:120] or "Browser PDF"
+                path = os.path.join(TEMP_DIR, safe_stem + ".pdf")
+                if os.path.exists(path):
+                    for number in range(2, 1000):
+                        candidate = os.path.join(
+                            TEMP_DIR, f"{safe_stem} ({number}).pdf"
+                        )
+                        if not os.path.exists(candidate):
+                            path = candidate
+                            break
+                    else:
+                        path = os.path.join(
+                            TEMP_DIR, f"{safe_stem} {uuid.uuid4().hex}.pdf"
+                        )
+                content_type = response.headers.get_content_type().lower()
+                try:
+                    expected_size = int(response.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    expected_size = 0
+                next_progress_announcement = 25
+                download_started = time.monotonic()
+                total = 0
+                first = b""
+                with open(path, "wb") as output:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        if not first:
+                            first = chunk[:8]
+                        total += len(chunk)
+                        if total > 100 * 1024 * 1024:
+                            raise ValueError("The PDF is larger than ScanBox's 100 MB limit.")
+                        output.write(chunk)
+                        if expected_size > 0:
+                            percentage = min(99, int(total * 100 / expected_size))
+                            if percentage >= next_progress_announcement:
+                                wx.CallAfter(
+                                    self._browser_pdf_download_progress,
+                                    next_progress_announcement,
+                                    time.monotonic() - download_started >= 2.5,
+                                )
+                                next_progress_announcement += 25
+                if not first.startswith(b"%PDF-"):
+                    raise ValueError(
+                        f"The current tab did not return a PDF (content type: {content_type})."
+                    )
+            logger.info(
+                "Downloaded browser PDF bytes=%d elapsed=%.2fs",
+                total,
+                time.perf_counter() - started,
+            )
+            wx.CallAfter(self._open_downloaded_browser_pdf, path)
+        except Exception as exc:
+            if path:
+                _remove_quietly(path)
+            logger.exception("Current browser PDF download failed")
+            wx.CallAfter(self._finish_browser_pdf_error, str(exc))
+
+    def _open_downloaded_browser_pdf(self, path):
+        self.busy = False
+        self.update_controls()
+        try:
+            opening_word = bool(
+                sys.platform == "win32"
+                and self.app_settings.get("open_word_after_pdf_conversion", False)
+                and microsoft_word_available()
+            )
+            message = (
+                "PDF downloaded. Converting and opening it in Microsoft Word. Please wait."
+                if opening_word
+                else "PDF downloaded. Reading it in ScanBox. Please wait."
+            )
+            self.SetStatusText(message)
+            announce(message)
+            self.process_pdf(path)
+        except Exception as exc:
+            _remove_quietly(path)
+            self._finish_browser_pdf_error(str(exc))
+
+    def _finish_browser_pdf_error(self, message):
+        self.busy = False
+        self.update_controls()
+        self.SetStatusText("Current browser PDF could not be imported.")
+        wx.MessageBox(message, "Current browser PDF unavailable", wx.OK | wx.ICON_ERROR)
+
+    def _browser_pdf_download_progress(self, percentage, speak):
+        message = f"Downloading current browser PDF: {percentage} percent."
+        self.SetStatusText(message)
+        if speak:
+            announce(message)
+
     def _start_macos_helper(self):
         """Start the native hotkey and ScreenCaptureKit companion process."""
         global _mac_announce_process
@@ -3817,7 +4031,7 @@ class ScanBox(wx.Frame):
                 kind, _separator, value = line.partition("\t")
                 if kind in {
                     "describe", "ocr", "ask", "toggle", "error", "fatal",
-                    "accessibility", "ready", "hotkey",
+                    "browser-pdf", "accessibility", "ready", "hotkey",
                 }:
                     wx.CallAfter(self._handle_macos_helper_event, kind, value)
                 else:
@@ -3847,6 +4061,9 @@ class ScanBox(wx.Frame):
             return
         if kind == "toggle":
             self.toggle_window_visibility()
+            return
+        if kind == "browser-pdf":
+            self.on_browser_pdf_hotkey()
             return
         if kind == "accessibility":
             logger.warning("macOS Accessibility reminder: %s", value)
@@ -5857,6 +6074,9 @@ class ScanBox(wx.Frame):
             wx.CallAfter(self._finish_pdf_needs_ocr, str(exc))
         except Exception as exc:
             wx.CallAfter(self._finish_pdf_error, f"Processing failed: {exc}")
+        finally:
+            if os.path.basename(source).startswith("browser_"):
+                _remove_quietly(source)
 
     def render_pdf_page(self, page, page_number):
         scale = 2.0
@@ -6759,6 +6979,7 @@ class ScanBox(wx.Frame):
                 if event.CanVeto():
                     event.Veto()
                     return
+            self.browser_url_executor.shutdown(wait=False, cancel_futures=True)
             # A delayed capture or FaceAlign check is not represented by self.busy,
             # so stop those workflows before the delayed exit announcement.
             self.camera_capture_timer.Stop()
@@ -6795,6 +7016,10 @@ class ScanBox(wx.Frame):
                 pass
             try:
                 self.UnregisterHotKey(self.screen_question_hotkey_id)
+            except Exception:
+                pass
+            try:
+                self.UnregisterHotKey(self.browser_pdf_hotkey_id)
             except Exception:
                 pass
             try:
@@ -6868,6 +7093,10 @@ class ScanBox(wx.Frame):
             self,
             "Save text",
             defaultDir=OUTPUT_DIR,
+            # Leave the extension off so the selected file-type filter controls
+            # whether this becomes TXT, DOCX or PDF unless the user explicitly
+            # types an extension of their own.
+            defaultFile=suggested_document_filename(merged, ""),
             wildcard="Text (*.txt)|*.txt|Word (*.docx)|*.docx|PDF (*.pdf)|*.pdf",
             style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT,
         )

@@ -32,6 +32,8 @@ Tabs
 
 2. Import
    - import a document image, PDF, photograph, or batch of photographs
+   - press Control+Shift+hyphen while viewing a public HTTPS PDF in a supported
+     browser to import it directly
    - OCR Document upon import enables OCR for scanned PDF conversion
    - leave OCR Document upon import off for a selectable-text PDF when table-aware conversion
      is preferred
@@ -73,7 +75,9 @@ What you need
   about it, and Control+Option+backslash toggles ScanBox. macOS requires Screen
   Recording permission under System Settings > Privacy & Security for window
   capture; native shortcut registration does not require Accessibility
-  permission. Reopen ScanBox after granting Screen Recording permission.
+  permission. Importing the current browser PDF does require Accessibility on
+  macOS so ScanBox can read the foreground browser's address field. Reopen
+  ScanBox after granting either permission.
 
   Text recognition uses Windows OCR on Windows and Apple Vision on macOS. The
   optional local vision model is downloaded on demand (see below).
@@ -217,3 +221,6 @@ An internet connection is used in the following circumstances:
     it does not upload documents, images, screenshots, or recognised text.
   - Installing or updating a local AI model downloads the required model files
     from their published source.
+  - Import PDF from Current Browser Tab downloads the public HTTPS PDF shown in
+    the foreground browser. ScanBox does not inherit browser cookies or login
+    sessions, and rejects non-PDF responses and files larger than 100 MB.

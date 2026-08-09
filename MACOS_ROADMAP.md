@@ -12,7 +12,7 @@ services are being replaced incrementally on the `macos-port` branch.
   repositionable USB document camera.
 - Detect, crop, straighten, and recognise camera-captured pages with the
   existing pipeline.
-- Run Florence-2 locally through ONNX Runtime.
+- Run Qwen3-VL 2B locally through ScanBox's private multimodal runner.
 - Save text, PDF, DOCX, and image results.
 - Retain the Photo Library, Help, About, update checks, and settings.
 - Support VoiceOver announcements and accessible keyboard navigation.
