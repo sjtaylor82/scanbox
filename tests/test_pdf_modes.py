@@ -21,6 +21,27 @@ class _Pdf:
 
 
 class PdfModeTests(unittest.TestCase):
+    def test_no_ocr_is_the_default_pdf_mode(self):
+        self.assertEqual(scanbox.DEFAULT_APP_SETTINGS["pdf_ocr_mode"], "none")
+
+    def test_pdf_completion_does_not_announce_entire_document(self):
+        frame = mock.Mock()
+        frame.app_settings = {
+            "show_page_headings": False,
+            "render_converted_in_window": True,
+        }
+        frame.page_counter = 0
+        frame.session_pages = []
+        frame.session_page_modes = []
+        pages = ["A" * 300_000]
+
+        with mock.patch.object(scanbox, "announce") as speak:
+            scanbox.ScanBox._finish_pdf_text(frame, pages)
+
+        frame.append_output.assert_called_once_with(pages[0] + "\n\n")
+        frame.output_box.SetFocusFromKbd.assert_called_once_with()
+        speak.assert_called_once_with("PDF reading completed.")
+
     def test_ocr_off_does_not_recognize_image_only_page(self):
         page = mock.Mock()
         page.get_text.return_value = ""

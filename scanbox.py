@@ -6359,7 +6359,7 @@ class ScanBox(wx.Frame):
             # disabled. Return it to the completed reading, matching the image
             # and batch completion paths, so screen readers expose the result.
             self.output_box.SetFocusFromKbd()
-            announce("\n\n".join(pages))
+            announce("PDF reading completed.")
 
     def open_document_file(self, path):
         try:
