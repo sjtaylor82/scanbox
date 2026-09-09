@@ -749,10 +749,11 @@ struct ScanBoxMacHelper {
                 }
                 for index in 0..<document.pageCount {
                     guard let page = document.page(at: index) else { continue }
-                    var text = (page.string ?? "").trimmingCharacters(
+                    let selectableText = (page.string ?? "").trimmingCharacters(
                         in: .whitespacesAndNewlines
                     )
-                    if text.isEmpty && useOCR {
+                    var text = selectableText
+                    if useOCR {
                         let bounds = page.bounds(for: .mediaBox)
                         let target = NSSize(
                             width: max(1, bounds.width * 2),
@@ -764,7 +765,11 @@ struct ScanBoxMacHelper {
                             context: nil,
                             hints: nil
                         ) {
-                            text = try recognisedText(in: cgImage)
+                            let recognised = try recognisedText(in: cgImage)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !recognised.isEmpty {
+                                text = recognised
+                            }
                         }
                     }
                     let encoded = Data(text.utf8).base64EncodedString()

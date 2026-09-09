@@ -112,8 +112,10 @@ separate handwriting mode.</p>
   <li><strong>Import Photo</strong> describes photographs and adds the descriptions to Scanbox's photo library. </li>
 </ul>
 
-<p>For a PDF requiring OCR, select <strong>OCR Document upon import</strong>. Leave
-it cleared when the PDF already contains selectable text. On Windows, tables will also be preserved if the document has them.</p>
+<p>Select <strong>OCR Document upon import</strong> to OCR the whole PDF,
+including pages that already contain selectable text. Leave it cleared to use
+only the PDF's existing selectable text. On Windows, tables are preserved when
+selectable text is used; OCR produces paragraphs instead.</p>
 
 <p>Windows uses its native OCR engine. macOS uses Apple Vision. No separate OCR
 package is required.</p>
@@ -188,7 +190,7 @@ ScanBox.</p>
 license information and About ScanBox.</p>
 
 <ul>
-  <li>If a scanned PDF contains no readable text, select
+  <li>If a scanned PDF has no selectable text, or its text is corrupt or incomplete, select
   <strong>OCR Document upon import</strong> and import it again.</li>
   <li>If camera text is unclear, keep the page steady, fill the picture with
   the page and reduce glare.</li>
