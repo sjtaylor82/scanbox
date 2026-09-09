@@ -102,8 +102,8 @@ app = BUNDLE(
     bundle_identifier="au.com.scanbox.ScanBox",
     info_plist={
         "CFBundleDisplayName": "ScanBox",
-        "CFBundleShortVersionString": "2026.9.0",
-        "CFBundleVersion": "2026.9.0",
+        "CFBundleShortVersionString": "2026.9.1",
+        "CFBundleVersion": "2026.9.1",
         "LSApplicationCategoryType": "public.app-category.productivity",
         "NSCameraUsageDescription": (
             "ScanBox uses the selected camera to capture documents and "

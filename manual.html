@@ -150,6 +150,11 @@ photograph.</p>
 8 GB of memory, ScanBox can keep it ready in the background for faster later
 descriptions. Printed document OCR works without either model.</p>
 
+<p>On Windows, ScanBox prefers a recognisable dedicated graphics processor
+over integrated graphics when Qwen uses Vulkan. Choose <strong>Local AI
+Acceleration</strong> from the Help menu to hear the active model and the
+graphics processor used by the current or most recent description.</p>
+
 <h2 id="other-apps">7. Describe Another Application</h2>
 
 <p>ScanBox can remain in the background while you use Safari, Mail, a web
@@ -165,6 +170,11 @@ then use:</p>
 <p>The shortcuts use the Control key on both Windows and macOS. On macOS,
 allow ScanBox to record the screen when the system first asks. Only the active
 window is captured.</p>
+
+<p>While a window is being processed, ScanBox places
+<strong>Processing...</strong> in Results. You can return to ScanBox and
+navigate normally; the placeholder is replaced when the result arrives. You
+can also close ScanBox during processing to cancel the work and exit.</p>
 
 <p>Use <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>\</kbd> on Windows, or
 <kbd>Control</kbd>+<kbd>Option</kbd>+<kbd>\</kbd> on macOS, to hide or restore
@@ -186,8 +196,10 @@ ScanBox.</p>
 
 <h2 id="help">9. Help and Troubleshooting</h2>
 
-<p>The Help menu contains this guide, Check for Updates, Donate to Project,
-license information and About ScanBox.</p>
+<p>The Help menu contains this guide, Local AI Acceleration, Check for Updates,
+Donate to Project, license information and About ScanBox. Portable builds can
+download and install an accepted update while retaining settings and downloaded
+AI models.</p>
 
 <ul>
   <li>If a scanned PDF has no selectable text, choose one of the two OCR modes

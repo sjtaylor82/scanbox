@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import signal
 import socket
 import subprocess
@@ -22,6 +23,7 @@ import uuid
 import platform
 import zipfile
 import tarfile
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 from get_active_tab_url import (
@@ -51,11 +53,110 @@ from fpdf import FPDF
 from PIL import Image, ImageGrab, ImageOps, UnidentifiedImageError
 
 APP_NAME = "ScanBox"
-APP_VERSION = "2026.9.0"
+APP_VERSION = "2026.9.1"
 UPDATE_MANIFEST_URL = os.environ.get(
     "SCANBOX_UPDATE_MANIFEST_URL",
     "https://api.github.com/repos/sjtaylor82/scanbox/releases/latest",
 ).strip()
+
+
+def _release_asset_url(manifest, platform_name=None):
+    """Return the current platform's portable ZIP from a GitHub release."""
+    platform_name = platform_name or sys.platform
+    expected_suffix = (
+        "-Windows-x64.zip" if platform_name == "win32"
+        else "-macOS.zip" if platform_name == "darwin"
+        else ""
+    )
+    if expected_suffix:
+        for asset in manifest.get("assets", []):
+            name = str(asset.get("name", ""))
+            url = str(asset.get("browser_download_url", "")).strip()
+            if name.endswith(expected_suffix) and url.startswith("https://"):
+                return url
+    return str(manifest.get("html_url") or manifest.get("url", "")).strip()
+
+
+def _prepare_update_payload(archive_path, platform_name=None):
+    """Validate and extract an official portable update into system temp."""
+    platform_name = platform_name or sys.platform
+    expected = (
+        "ScanBox/ScanBox.exe" if platform_name == "win32"
+        else "ScanBox.app/Contents/MacOS/ScanBox" if platform_name == "darwin"
+        else ""
+    )
+    if not expected:
+        raise RuntimeError("Automatic installation is unavailable on this platform.")
+    with zipfile.ZipFile(archive_path) as bundle:
+        members = bundle.namelist()
+        for name in members:
+            path = Path(name.replace("\\", "/"))
+            if path.is_absolute() or ".." in path.parts:
+                raise ValueError("The update archive contains an unsafe path.")
+        if expected not in members:
+            raise ValueError("The update archive does not contain the expected application.")
+        staging = os.path.join(
+            tempfile.gettempdir(), f"scanbox-update-{uuid.uuid4().hex}"
+        )
+        os.makedirs(staging)
+        bundle.extractall(staging)
+    return os.path.join(staging, "ScanBox" if platform_name == "win32" else "ScanBox.app")
+
+
+def _launch_portable_updater(payload_path):
+    """Replace this portable build after its running process has exited."""
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError("Automatic installation is available only in packaged builds.")
+    process_id = os.getpid()
+    token = uuid.uuid4().hex
+    if sys.platform == "win32":
+        install_dir = os.path.abspath(BASE)
+        script_path = os.path.join(tempfile.gettempdir(), f"scanbox-update-{token}.ps1")
+
+        def quote(value):
+            return "'" + str(value).replace("'", "''") + "'"
+
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Wait-Process -Id {process_id}\n"
+            f"$payload = {quote(payload_path)}\n"
+            f"$install = {quote(install_dir)}\n"
+            "Get-ChildItem -LiteralPath $payload | "
+            "Copy-Item -Destination $install -Recurse -Force\n"
+            f"Start-Process -FilePath {quote(os.path.join(install_dir, 'ScanBox.exe'))}\n"
+        )
+        with open(script_path, "w", encoding="utf-8", newline="\r\n") as script_file:
+            script_file.write(script)
+        subprocess.Popen(
+            [
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", script_path,
+            ],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return
+    if sys.platform == "darwin":
+        current_app = str(Path(sys.executable).resolve().parents[2])
+        backup_app = current_app + f".previous-{token}"
+        script_path = os.path.join(tempfile.gettempdir(), f"scanbox-update-{token}.sh")
+        script = (
+            "#!/bin/sh\nset -e\n"
+            f"while kill -0 {process_id} 2>/dev/null; do sleep 1; done\n"
+            f"mv {shlex.quote(current_app)} {shlex.quote(backup_app)}\n"
+            f"mv {shlex.quote(payload_path)} {shlex.quote(current_app)}\n"
+            f"open {shlex.quote(current_app)}\n"
+        )
+        with open(script_path, "w", encoding="utf-8", newline="\n") as script_file:
+            script_file.write(script)
+        os.chmod(script_path, 0o700)
+        subprocess.Popen(
+            ["/bin/sh", script_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return
+    raise RuntimeError("Automatic installation is unavailable on this platform.")
 
 
 if sys.platform == "win32":
@@ -260,6 +361,9 @@ QWEN_PRELOAD_MINIMUM_RAM = 8 * 1024**3
 # of the session rather than repeating the same failed attempt on every
 # photo.
 _mtmd_gpu_out_of_memory = False
+_mtmd_server_backend = None
+_mtmd_active_backend = None
+_mtmd_last_backend = None
 
 _MTMD_GPU_OOM_MARKERS = (
     "kIOGPUCommandBufferCallbackErrorOutOfMemory",
@@ -1260,6 +1364,100 @@ def _find_mtmd_runners():
     return sorted(found, key=priority)
 
 
+def _mtmd_backend_label(runner, accelerated):
+    """Return the user-facing processor backend requested from llama.cpp."""
+    if not accelerated:
+        return "CPU"
+    if "vulkan" in runner.lower():
+        return "GPU via Vulkan"
+    if sys.platform == "darwin":
+        return "GPU via Metal"
+    return "GPU"
+
+
+def _parse_mtmd_devices(output):
+    """Parse llama.cpp device rows into names, labels, and free memory."""
+    devices = []
+    pattern = re.compile(
+        r"^\s*(Vulkan\d+):\s*(.*?)\s*\((\d+)\s+MiB,\s*(\d+)\s+MiB free\)\s*$",
+        re.IGNORECASE,
+    )
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if match:
+            devices.append({
+                "id": match.group(1),
+                "label": match.group(2).strip(),
+                "memory_mib": int(match.group(3)),
+                "free_mib": int(match.group(4)),
+            })
+    return devices
+
+
+def _preferred_mtmd_device(runner):
+    """Prefer a likely discrete Vulkan GPU, then the strongest available device."""
+    if "vulkan" not in runner.lower():
+        return None
+    try:
+        result = subprocess.run(
+            [runner, "--list-devices"], check=False, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=10,
+            **NO_WINDOW,
+        )
+        devices = _parse_mtmd_devices(result.stdout + "\n" + result.stderr)
+    except Exception:
+        logger.exception("Could not inspect Vulkan devices")
+        return None
+    if not devices:
+        return None
+
+    def preference(device):
+        label = device["label"].lower()
+        if any(term in label for term in ("geforce", "quadro", "tesla", "rtx", "gtx")):
+            tier = 4
+        elif any(term in label for term in ("radeon rx", "radeon pro")):
+            tier = 4
+        elif "nvidia" in label:
+            tier = 3
+        elif "amd" in label or "radeon" in label:
+            tier = 2
+        elif "intel" in label:
+            tier = 1
+        else:
+            tier = 0
+        return tier, device["free_mib"], device["memory_mib"]
+
+    return max(devices, key=preference)
+
+
+def local_ai_acceleration_report(model_id):
+    """Name the selected model and processor used for real inference."""
+    model = VISION_MODELS.get(model_id, VISION_MODELS[DEFAULT_VISION_MODEL_ID])
+    if model["runner"] == "florence":
+        return (
+            f"Active model: {model['name']}\n"
+            "Graphics processor used: none; this model uses the CPU."
+        )
+    if _find_mtmd_model_files(model_id) is None:
+        return f"Active model: {model['name']}\nGraphics processor used: model not installed."
+    runners = _find_mtmd_runners()
+    if not runners:
+        return f"Active model: {model['name']}\nGraphics processor used: runner not installed."
+    runner = runners[0]
+    actual_backend = _mtmd_active_backend or _mtmd_last_backend
+    if actual_backend and actual_backend.startswith("GPU"):
+        selected = _preferred_mtmd_device(runner)
+        processor = selected["label"] if selected else actual_backend
+    elif actual_backend == "CPU":
+        processor = "none; the most recent description used the CPU"
+    else:
+        processor = "not yet known; describe an image first"
+    return (
+        f"Active model: {model['name']}\n"
+        f"Graphics processor used: {processor}."
+    )
+
+
 def _find_mtmd_model_files(model_id):
     model = VISION_MODELS.get(model_id)
     if not model or model["runner"] != "mtmd":
@@ -1379,12 +1577,13 @@ def _bind_process_lifetime_to_scanbox(process):
 
 def stop_mtmd_server():
     global _mtmd_server_process, _mtmd_server_port, _mtmd_server_model_id
-    global _mtmd_server_loading, _mtmd_server_job
+    global _mtmd_server_loading, _mtmd_server_job, _mtmd_server_backend
     with _mtmd_server_lock:
         process = _mtmd_server_process
         _mtmd_server_process = None
         _mtmd_server_port = None
         _mtmd_server_model_id = None
+        _mtmd_server_backend = None
         loading = _mtmd_server_loading
         _mtmd_server_loading = None
         job = _mtmd_server_job
@@ -1416,7 +1615,7 @@ def stop_mtmd_server():
 def start_mtmd_server(model_id="qwen3_vl_2b"):
     """Load Qwen once and keep it available for later descriptions."""
     global _mtmd_server_process, _mtmd_server_port, _mtmd_server_model_id
-    global _mtmd_server_loading, _mtmd_server_job
+    global _mtmd_server_loading, _mtmd_server_job, _mtmd_server_backend
     if model_id != "qwen3_vl_2b" or _total_physical_memory() < QWEN_PRELOAD_MINIMUM_RAM:
         return False
     files = _find_mtmd_model_files(model_id)
@@ -1446,6 +1645,15 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
     accelerated = (
         "vulkan" in runner.lower() or sys.platform == "darwin"
     ) and not _mtmd_gpu_out_of_memory
+    selected_device = _preferred_mtmd_device(runner) if accelerated else None
+    backend = _mtmd_backend_label(runner, accelerated)
+    logger.info(
+        "Starting persistent %s service; processor=%s device=%s runner=%s",
+        model_id,
+        backend,
+        selected_device["label"] if selected_device else "default",
+        runner,
+    )
     command = [
         server, "-m", files[0], "--mmproj", files[1],
         "--host", "127.0.0.1", "--port", str(port), "--no-webui",
@@ -1455,6 +1663,8 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
         "--image-min-tokens", str(MTMD_IMAGE_TOKENS),
         "--image-max-tokens", str(MTMD_IMAGE_TOKENS),
     ]
+    if selected_device:
+        command.extend(["--device", selected_device["id"]])
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     try:
         process = subprocess.Popen(
@@ -1474,7 +1684,13 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
             try:
                 with urllib.request.urlopen(health_url, timeout=1) as response:
                     if response.status == 200:
-                        logger.info("Persistent %s service ready on local port %d", model_id, port)
+                        logger.info(
+                            "Persistent %s service ready on local port %d; processor=%s",
+                            model_id,
+                            port,
+                            backend,
+                        )
+                        _mtmd_server_backend = backend
                         loading.set()
                         return True
             except (OSError, urllib.error.URLError):
@@ -1488,6 +1704,7 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
 
 
 def _run_mtmd_server_task(prompt, image_path, max_tokens, cancel_event=None):
+    global _mtmd_active_backend, _mtmd_last_backend
     with _mtmd_server_lock:
         process = _mtmd_server_process
         port = _mtmd_server_port
@@ -1542,12 +1759,17 @@ def _run_mtmd_server_task(prompt, image_path, max_tokens, cancel_event=None):
     watcher = threading.Thread(target=watch_cancel, daemon=True)
     watcher.start()
     try:
+        backend = _mtmd_server_backend or "CPU"
+        _mtmd_active_backend = backend
         with urllib.request.urlopen(request, timeout=MTMD_TIMEOUT_SECONDS) as response:
             result = json.load(response)
         cancelled.set()
         if cancel_event is not None and cancel_event.is_set():
             return PHOTO_DESCRIPTION_CANCELLED
-        return result["choices"][0]["message"]["content"].strip()
+        text = result["choices"][0]["message"]["content"].strip()
+        if text:
+            _mtmd_last_backend = backend
+        return text
     except Exception:
         cancelled.set()
         if cancel_event is not None and cancel_event.is_set():
@@ -1558,6 +1780,8 @@ def _run_mtmd_server_task(prompt, image_path, max_tokens, cancel_event=None):
         # allocation, which would otherwise load Qwen twice.
         stop_mtmd_server()
         return None
+    finally:
+        _mtmd_active_backend = None
 
 
 class DownloadCancelled(Exception):
@@ -1683,7 +1907,7 @@ def run_mtmd_task(
     task, image_path, model_id, prompt_override=None, max_tokens=512,
     cancel_event=None,
 ):
-    global _mtmd_gpu_out_of_memory
+    global _mtmd_gpu_out_of_memory, _mtmd_active_backend, _mtmd_last_backend
     runners = _find_mtmd_runners()
     files = _find_mtmd_model_files(model_id)
     if not runners or not files:
@@ -1708,7 +1932,12 @@ def run_mtmd_task(
 
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-    def run_once(runner, accelerated):
+    def run_once(runner, accelerated, selected_device=None):
+        logger.info(
+            "Starting local multimodal inference; processor=%s runner=%s",
+            _mtmd_backend_label(runner, accelerated),
+            runner,
+        )
         command = [
             runner, "-m", files[0], "--mmproj", files[1], "--image", image_path,
             "-p", prompt, "-n", str(max_tokens), "--temp", "0",
@@ -1718,6 +1947,8 @@ def run_mtmd_task(
             "--image-min-tokens", str(MTMD_IMAGE_TOKENS),
             "--image-max-tokens", str(MTMD_IMAGE_TOKENS),
         ]
+        if selected_device:
+            command.extend(["--device", selected_device["id"]])
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
@@ -1748,8 +1979,14 @@ def run_mtmd_task(
         accelerated = (
             "vulkan" in runner.lower() or sys.platform == "darwin"
         ) and not _mtmd_gpu_out_of_memory
+        backend = _mtmd_backend_label(runner, accelerated)
+        selected_device = _preferred_mtmd_device(runner) if accelerated else None
         try:
-            result, cancelled = run_once(runner, accelerated)
+            _mtmd_active_backend = backend
+            try:
+                result, cancelled = run_once(runner, accelerated, selected_device)
+            finally:
+                _mtmd_active_backend = None
             if cancelled:
                 return PHOTO_DESCRIPTION_CANCELLED
         except subprocess.TimeoutExpired:
@@ -1773,8 +2010,13 @@ def run_mtmd_task(
             logger.warning(
                 "GPU ran out of memory running %s; retrying on CPU.", runner
             )
+            backend = _mtmd_backend_label(runner, False)
             try:
-                result, cancelled = run_once(runner, False)
+                _mtmd_active_backend = backend
+                try:
+                    result, cancelled = run_once(runner, False)
+                finally:
+                    _mtmd_active_backend = None
                 if cancelled:
                     return PHOTO_DESCRIPTION_CANCELLED
             except subprocess.TimeoutExpired:
@@ -1789,6 +2031,7 @@ def run_mtmd_task(
                 logger.debug("Local multimodal runner diagnostics (%s, CPU retry):\n%s", runner, result.stderr.strip())
         text = (result.stdout or "").strip()
         if result.returncode == 0 and text:
+            _mtmd_last_backend = backend
             logger.info("Local multimodal runner used: %s", runner)
             break
         failures.append((result.stderr or text or "No result was returned.").strip())
@@ -2790,10 +3033,14 @@ class ScanBox(wx.Frame):
         self.install_cancel_event = None
         self._close_when_install_stops = False
         self.photo_cancel_event = None
+        self.shutdown_event = threading.Event()
+        self._skip_exit_file_cleanup = False
         self.photo_cancel_dialog = None
         self.photo_cancel_button = None
         self.last_active_mode = "document"
         self.busy = False
+        self.screen_capture_busy = False
+        self._screen_result_placeholder = None
         self.busy_status_visible = False
         self.busy_status_token = 0
         self.app_settings = read_app_settings()
@@ -2843,6 +3090,7 @@ class ScanBox(wx.Frame):
         permissions_item = None
         if sys.platform == "darwin":
             permissions_item = help_menu.Append(wx.ID_ANY, "Mac &Permissions")
+        acceleration_item = help_menu.Append(wx.ID_ANY, "Local AI &Acceleration...")
         self.check_updates_item = help_menu.Append(wx.ID_ANY, "Check for &Updates")
         donate_item = help_menu.Append(wx.ID_ANY, "&Donate to Project")
         license_item = help_menu.Append(wx.ID_ANY, "&License")
@@ -2864,6 +3112,7 @@ class ScanBox(wx.Frame):
         self.Bind(wx.EVT_MENU, self.open_user_manual, manual_item)
         if permissions_item is not None:
             self.Bind(wx.EVT_MENU, self.show_macos_permissions, permissions_item)
+        self.Bind(wx.EVT_MENU, self.show_local_ai_acceleration, acceleration_item)
         self.Bind(wx.EVT_MENU, self.check_for_updates, self.check_updates_item)
         self.Bind(wx.EVT_MENU, self.open_donation_page, donate_item)
         self.Bind(wx.EVT_MENU, self.open_license, license_item)
@@ -3494,9 +3743,7 @@ class ScanBox(wx.Frame):
                 manifest.get("version") or manifest["tag_name"]
             ).strip()
             self._version_parts(latest_version)
-            download_url = str(
-                manifest.get("url") or manifest.get("html_url", "")
-            ).strip()
+            download_url = _release_asset_url(manifest)
             notes = str(
                 manifest.get("notes") or manifest.get("body", "")
             ).strip()
@@ -3549,10 +3796,73 @@ class ScanBox(wx.Frame):
             message += f"\n\n{notes}"
         style = wx.YES_NO | wx.ICON_INFORMATION if download_url else wx.OK | wx.ICON_INFORMATION
         if download_url:
-            message += "\n\nWould you like to open the download page?"
+            if getattr(sys, "frozen", False) and download_url.lower().endswith(".zip"):
+                message += "\n\nWould you like ScanBox to download and install it now?"
+            else:
+                message += "\n\nWould you like to download it now?"
         answer = wx.MessageBox(message, "ScanBox Update Available", style, self)
         if download_url and answer == wx.YES:
-            wx.LaunchDefaultBrowser(download_url)
+            if getattr(sys, "frozen", False) and download_url.lower().endswith(".zip"):
+                self._start_update_download(latest_version, download_url)
+            else:
+                wx.LaunchDefaultBrowser(download_url)
+
+    def _start_update_download(self, latest_version, download_url):
+        """Download and stage a portable update without blocking the UI."""
+        self.check_updates_item.Enable(False)
+        self.SetStatusText(f"Downloading ScanBox {latest_version}...")
+        threading.Thread(
+            target=self._update_download_worker,
+            args=(latest_version, download_url),
+            name="ScanBox application update",
+            daemon=True,
+        ).start()
+
+    def _update_download_worker(self, latest_version, download_url):
+        archive_path = os.path.join(
+            tempfile.gettempdir(),
+            f"ScanBox-{latest_version.strip().lstrip('v')}-{uuid.uuid4().hex}.zip",
+        )
+        try:
+            _download_file(
+                download_url,
+                archive_path,
+                "ScanBox update",
+                lambda message: wx.CallAfter(self.SetStatusText, message),
+            )
+            payload_path = _prepare_update_payload(archive_path)
+            result = (payload_path, None)
+        except Exception as exc:
+            logger.exception("Could not download or prepare ScanBox update")
+            result = (None, str(exc))
+        wx.CallAfter(self._finish_update_download, *result)
+
+    def _finish_update_download(self, payload_path, error):
+        self.check_updates_item.Enable(True)
+        if error:
+            self.SetStatusText("ScanBox update failed.")
+            wx.MessageBox(
+                f"ScanBox could not install the update.\n\n{error}",
+                "Update Failed",
+                wx.OK | wx.ICON_ERROR,
+                self,
+            )
+            return
+        try:
+            _launch_portable_updater(payload_path)
+        except Exception as exc:
+            logger.exception("Could not launch ScanBox updater")
+            self.SetStatusText("ScanBox update failed.")
+            wx.MessageBox(
+                f"ScanBox could not launch the updater.\n\n{exc}",
+                "Update Failed",
+                wx.OK | wx.ICON_ERROR,
+                self,
+            )
+            return
+        self.SetStatusText("Update ready. Restarting ScanBox...")
+        self._close_after_announcement = True
+        self.Close()
 
     def on_mode_change(self, event):
         selected_tab = self.mode_tabs.GetSelection()
@@ -3567,10 +3877,12 @@ class ScanBox(wx.Frame):
         self.mode_tabs.SetFocus()
 
     def on_activate(self, event):
-        # Windows already restores keyboard focus to whatever control last
-        # had it when a top-level window is reactivated. Additional focus
-        # handling can move screen-reader focus to the frame instead of the
-        # previously active control, so leave the native behaviour intact.
+        # During a backslash screen workflow the previously focused action
+        # control is disabled. If the user Alt+Tabs back before completion,
+        # explicitly land in the enabled Results box instead of leaving the
+        # frame with no keyboard focus and no working Tab traversal.
+        if event.GetActive() and self.screen_capture_busy:
+            wx.CallAfter(self.output_box.SetFocusFromKbd)
         event.Skip()
 
     def _ensure_tray_icon(self):
@@ -3637,6 +3949,23 @@ class ScanBox(wx.Frame):
             logger.info("ScanBox restored by the global window shortcut")
             self.restore_from_notification_area()
 
+    def _begin_screen_processing(self):
+        """Keep a focusable placeholder available during screen processing."""
+        self.busy = True
+        self.screen_capture_busy = True
+        if not self.app_settings.get("append_text_to_buffer", False):
+            self.prepare_output_buffer()
+        self.output_box.Enable()
+        start = self.output_box.GetLastPosition()
+        separator = "\n\n" if start else ""
+        placeholder = separator + "Processing..."
+        self.output_box.AppendText(placeholder)
+        self.output_box.SetInsertionPoint(start + len(separator))
+        self.output_box.ShowPosition(start + len(separator))
+        self._screen_result_placeholder = (start, start + len(placeholder), separator)
+        self.update_controls()
+        self.SetStatusText("Processing...")
+
     def on_screen_hotkey(self, event=None):
         if self.busy:
             return
@@ -3652,8 +3981,7 @@ class ScanBox(wx.Frame):
             logger.exception("Could not capture the screen")
             wx.MessageBox(f"Could not capture the screen: {exc}", "Screen capture failed")
             return
-        self.busy = True
-        self.update_controls()
+        self._begin_screen_processing()
         threading.Thread(
             target=self._screen_description_worker,
             args=(path,),
@@ -3674,8 +4002,7 @@ class ScanBox(wx.Frame):
             logger.exception("Could not capture the screen for OCR")
             wx.MessageBox(f"Could not capture the screen: {exc}", "Screen capture failed")
             return
-        self.busy = True
-        self.update_controls()
+        self._begin_screen_processing()
         threading.Thread(
             target=self._screen_ocr_worker,
             args=(path,),
@@ -4209,8 +4536,7 @@ class ScanBox(wx.Frame):
 
         play_shutter_sound()
         self.last_active_mode = "document" if read_text else "photo"
-        self.busy = True
-        self.update_controls()
+        self._begin_screen_processing()
         self.Show(True)
         if self.IsIconized():
             self.Iconize(False)
@@ -4232,13 +4558,15 @@ class ScanBox(wx.Frame):
     def _screen_ocr_worker(self, path):
         try:
             detect_and_crop_screen_document(path)
-            text = self._read_screen_text(path, use_vision_fallback=True)
+            text = self._read_screen_text(
+                path, use_vision_fallback=True, cancel_event=self.shutdown_event
+            )
         except Exception as exc:
             logger.exception("Screen OCR failed")
             text = f"Processing failed: {exc}"
         wx.CallAfter(self._finish_screen_description, path, text)
 
-    def _read_screen_text(self, path, use_vision_fallback=False):
+    def _read_screen_text(self, path, use_vision_fallback=False, cancel_event=None):
         if sys.platform == "darwin":
             text = clean_screen_ocr_text(macos_ocr(path))
             native_ocr_name = "Apple Vision"
@@ -4250,12 +4578,16 @@ class ScanBox(wx.Frame):
             return text
         if use_vision_fallback and vision_ready("transcribe"):
             logger.info("Screen OCR used Florence-2 fallback")
-            return clean_screen_ocr_text(run_vision_task("transcribe", path))
+            return clean_screen_ocr_text(
+                run_vision_task("transcribe", path, cancel_event)
+            )
         return ""
 
     def _screen_description_worker(self, path):
         try:
-            text = self.process_photo(path, include_ocr=False)
+            text = self.process_photo(
+                path, include_ocr=False, cancel_event=self.shutdown_event
+            )
             detect_and_crop_screen_document(path)
             visible_text = self._read_screen_text(path)
             if visible_text:
@@ -4275,7 +4607,9 @@ class ScanBox(wx.Frame):
                 "details.\n\nQuestion: " + question
             )
             started = time.perf_counter()
-            text = run_mtmd_task("question", path, model_id, prompt, 384)
+            text = run_mtmd_task(
+                "question", path, model_id, prompt, 384, self.shutdown_event
+            )
             elapsed = time.perf_counter() - started
             if not text.startswith("Local vision"):
                 text += (
@@ -4402,7 +4736,16 @@ class ScanBox(wx.Frame):
 
     def _finish_screen_description(self, path, text):
         self.busy = False
-        self.append_output(text + "\n\n")
+        self.screen_capture_busy = False
+        placeholder = self._screen_result_placeholder
+        self._screen_result_placeholder = None
+        if placeholder is not None:
+            start, end, separator = placeholder
+            self.output_box.Replace(start, end, separator + text + "\n\n")
+            self.output_box.SetInsertionPoint(start + len(separator))
+            self.output_box.ShowPosition(start + len(separator))
+        else:
+            self.append_output(text + "\n\n")
         self.update_controls()
         wx.CallLater(1000, announce, text)
         try:
@@ -4500,7 +4843,10 @@ class ScanBox(wx.Frame):
         self.stop_camera_btn.Show(camera_workflow_active)
         self.stop_camera_btn.SetLabel("Stop Camera Capture")
 
-        self.mode_tabs.Enable(not interaction_locked)
+        # Keep navigation and existing Results text reachable while the two
+        # backslash screen workflows run. Their action controls remain
+        # disabled below, preventing concurrent work.
+        self.mode_tabs.Enable(not interaction_locked or self.screen_capture_busy)
         self.document_scan_btn.Enable(not interaction_locked)
         self.scan_save_images_btn.Enable(not interaction_locked)
         self.document_camera_btn.Enable(not interaction_locked)
@@ -6361,6 +6707,19 @@ class ScanBox(wx.Frame):
             self.output_box.SetFocusFromKbd()
             announce("PDF reading completed.")
 
+    def show_local_ai_acceleration(self, event=None):
+        """Show the processor used by the selected local AI model."""
+        report = local_ai_acceleration_report(
+            self.app_settings.get("vision_model", DEFAULT_VISION_MODEL_ID)
+        )
+        logger.info("Local AI acceleration status: %s", report.replace("\n", " | "))
+        wx.MessageBox(
+            report,
+            "Local AI Acceleration",
+            wx.OK | wx.ICON_INFORMATION,
+            self,
+        )
+
     def open_document_file(self, path):
         try:
             open_with_default_application(path)
@@ -7057,27 +7416,21 @@ class ScanBox(wx.Frame):
         if getattr(self, "_close_after_announcement", False):
             self._close_after_announcement = False
         else:
-            if self.installing:
-                if wx.MessageBox(
-                    "A local AI model is downloading. Cancel the download and close ScanBox?",
-                    "Cancel AI Download",
-                    wx.YES_NO | wx.ICON_QUESTION,
-                ) == wx.YES:
-                    self._close_when_install_stops = True
-                    self.cancel_ai_download()
-                if event.CanVeto():
-                    event.Veto()
-                    return
-            if self.busy or self.image_export_active:
-                wx.MessageBox(
-                    "ScanBox is still processing. Please "
-                    "wait for it to finish before closing so temporary input files "
-                    "are not removed while they are in use.",
-                    "ScanBox is busy",
-                )
-                if event.CanVeto():
-                    event.Veto()
-                    return
+            processing = self.installing or self.busy or self.image_export_active
+            if processing:
+                # Closing the application is also an emergency stop. Signal all
+                # cancellable workers and leave their temporary inputs untouched;
+                # a clean sweep at the next startup is safer than trapping the user
+                # in an application they may be closing because it stopped responding.
+                self._skip_exit_file_cleanup = True
+                self.shutdown_event.set()
+                if self.install_cancel_event is not None:
+                    self.install_cancel_event.set()
+                if self.photo_cancel_event is not None:
+                    self.photo_cancel_event.set()
+                if getattr(self, "batch_cancel_event", None) is not None:
+                    self.batch_cancel_event.set()
+                logger.info("Close requested during processing; cancelling work and exiting")
             self.browser_url_executor.shutdown(wait=False, cancel_futures=True)
             # A delayed capture or FaceAlign check is not represented by self.busy,
             # so stop those workflows before the delayed exit announcement.
@@ -7101,8 +7454,12 @@ class ScanBox(wx.Frame):
         self.camera_alignment_active = False
         self.close_facealign_dialog()
         stop_mtmd_server()
-        clear_temp_directory()
-        if self.app_settings.get("delete_output_files_on_exit"):
+        if not self._skip_exit_file_cleanup:
+            clear_temp_directory()
+        if (
+            not self._skip_exit_file_cleanup
+            and self.app_settings.get("delete_output_files_on_exit")
+        ):
             self.delete_created_output_files()
         if sys.platform == "win32":
             try:
@@ -7607,6 +7964,10 @@ def main():
         wx.MessageBox(message, "ScanBox", wx.OK | wx.ICON_INFORMATION)
         return
 
+    # A forced close deliberately leaves in-use temporary inputs alone. Once
+    # the single-instance check proves no older ScanBox is still using them,
+    # they are safe to remove at the beginning of this new session.
+    clear_temp_directory()
     app = wx.App(False)
     app.SetExitOnFrameDelete(True)
     frame = ScanBox()

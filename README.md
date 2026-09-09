@@ -1,7 +1,7 @@
 ScanBox
 =======
 
-ScanBox 2026.9.0 is a privacy-first scanning, recognition, and image-description
+ScanBox 2026.9.1 is a privacy-first scanning, recognition, and image-description
 app for 64-bit Windows 10 and 11. A macOS 14-or-later test preview is also
 available.
 Documents, photographs, screenshots, OCR results, and AI descriptions are
@@ -111,6 +111,18 @@ Available models
   On computers with at least 8 GB of memory, Qwen is loaded quietly at launch
   and kept ready until ScanBox closes. This substantially reduces the wait for
   later descriptions. Computers below 8 GB load it only when needed.
+  On Windows, ScanBox automatically prefers a recognisable dedicated Vulkan GPU
+  over integrated graphics. Help > Local AI Acceleration reports the active
+  model and the graphics processor used by the current or latest description.
+
+Screen workflows
+----------------
+
+Control+backslash describes the foreground application window and
+Control+Shift+backslash reads its text. Results immediately shows
+`Processing...`, remains keyboard accessible if you return to ScanBox, and is
+replaced by the completed result. Closing ScanBox during processing cancels the
+work and exits; stale temporary inputs are removed safely on the next startup.
 
 Saving results
 --------------
@@ -227,6 +239,8 @@ An internet connection is used in the following circumstances:
     enabled by default and can be disabled under Settings > General. The check
     sends standard web-request information and the installed ScanBox version;
     it does not upload documents, images, screenshots, or recognised text.
+    Portable Windows and macOS builds can download and install an accepted
+    update automatically. User settings and downloaded AI models are retained.
   - Installing or updating a local AI model downloads the required model files
     from their published source.
   - Import PDF from Current Browser Tab downloads the public HTTPS PDF shown in
