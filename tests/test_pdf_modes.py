@@ -70,6 +70,23 @@ class PdfModeTests(unittest.TestCase):
         self.assertEqual(pages, ["ocr text"])
         recognize.assert_called_once_with("rendered.png")
 
+    def test_all_pages_mode_recognizes_page_with_selectable_text(self):
+        page = mock.Mock()
+        page.get_text.return_value = "embedded text"
+        frame = mock.Mock()
+        frame.render_pdf_page.return_value = "rendered.png"
+
+        with mock.patch.object(scanbox.fitz, "open", return_value=_Pdf(page)), \
+                mock.patch.object(scanbox, "windows_ocr", return_value="ocr text") \
+                as recognize, \
+                mock.patch.object(scanbox, "_remove_quietly"):
+            pages = scanbox.ScanBox.read_pdf_pages_with_native_ocr(
+                frame, "document.pdf", all_pages=True
+            )
+
+        self.assertEqual(pages, ["ocr text"])
+        recognize.assert_called_once_with("rendered.png")
+
 
 if __name__ == "__main__":
     unittest.main()

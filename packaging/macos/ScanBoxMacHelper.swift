@@ -742,7 +742,9 @@ struct ScanBoxMacHelper {
             if CommandLine.arguments.count == 4,
                CommandLine.arguments[1] == "read-pdf" {
                 let pdfURL = URL(fileURLWithPath: CommandLine.arguments[2])
-                let useOCR = CommandLine.arguments[3] == "ocr"
+                let mode = CommandLine.arguments[3]
+                let useOCR = mode == "ocr-missing" || mode == "ocr-all"
+                let ocrAllPages = mode == "ocr-all"
                 guard let document = PDFDocument(url: pdfURL),
                       document.pageCount > 0 else {
                     throw HelperError.imageWriteFailed
@@ -753,7 +755,7 @@ struct ScanBoxMacHelper {
                         in: .whitespacesAndNewlines
                     )
                     var text = selectableText
-                    if text.isEmpty && useOCR {
+                    if useOCR && (text.isEmpty || ocrAllPages) {
                         let bounds = page.bounds(for: .mediaBox)
                         let target = NSSize(
                             width: max(1, bounds.width * 2),

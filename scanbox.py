@@ -231,8 +231,8 @@ DEFAULT_APP_SETTINGS = {
     "render_converted_in_window": True,
     "diagnostic_logging": False,
     "append_text_to_buffer": False,
-    # Controls OCR for imported PDF documents; see self.use_ocr_checkbox.
-    "use_ocr_enabled": False,
+    # Controls OCR for imported PDF documents; see self.pdf_ocr_radio.
+    "pdf_ocr_mode": "none",
     "show_page_headings": False,
     "last_import_dir": "",
     "camera_delay_seconds": 5,
@@ -547,6 +547,7 @@ def read_app_settings():
     unconditionally cast everything to bool, which silently corrupted string
     settings like last_import_dir into True/False."""
     settings = dict(DEFAULT_APP_SETTINGS)
+    loaded = {}
     if os.path.exists(APP_SETTINGS_CONFIG):
         try:
             with open(APP_SETTINGS_CONFIG, "r", encoding="utf-8") as f:
@@ -563,6 +564,14 @@ def read_app_settings():
                     settings[key] = value
         except Exception:
             pass
+    # Migrate the former two-state checkbox. Checked meant OCR pages lacking
+    # selectable text; unchecked meant no OCR.
+    if "pdf_ocr_mode" not in loaded:
+        settings["pdf_ocr_mode"] = (
+            "missing_text" if loaded.get("use_ocr_enabled", False) else "none"
+        )
+    if settings["pdf_ocr_mode"] not in {"none", "missing_text", "all_pages"}:
+        settings["pdf_ocr_mode"] = "none"
     # Older settings files may contain the former notification-area option.
     # It is deliberately ignored: ordinary minimising must never hide ScanBox.
     settings["minimize_to_notification_area"] = False
@@ -2916,24 +2925,36 @@ class ScanBox(wx.Frame):
         self.mode_tabs.AddPage(self.scan_panel, "Scan")
 
         # Import tab - bring in existing files. PDF2Word cannot detect tables
-        # while OCR is running, so this document-specific checkbox switches a
-        # scanned PDF to OCR while leaving a normal text PDF table-aware.
+        # while OCR is running, so this document-specific group makes the
+        # conversion behavior explicit.
         self.import_panel = wx.Panel(self.mode_tabs)
         _set_named_page_accessible(self.import_panel, "Import")
         import_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        self.use_ocr_checkbox = wx.CheckBox(
-            self.import_panel, label="OCR Document upon import"
+        self.pdf_ocr_modes = ("none", "missing_text", "all_pages")
+        self.pdf_ocr_radio = wx.RadioBox(
+            self.import_panel,
+            label="PDF OCR",
+            choices=[
+                "No OCR.",
+                "OCR only pages with no selectable text.",
+                "OCR each page, including pages that contain selectable text.",
+            ],
+            majorDimension=1,
+            style=wx.RA_SPECIFY_COLS,
         )
-        self.use_ocr_checkbox.SetName("OCR Document upon import")
-        self.use_ocr_checkbox.SetValue(
-            self.app_settings.get("use_ocr_enabled", False)
+        self.pdf_ocr_radio.SetName("PDF OCR")
+        current_ocr_mode = self.app_settings.get("pdf_ocr_mode", "none")
+        self.pdf_ocr_radio.SetSelection(
+            self.pdf_ocr_modes.index(current_ocr_mode)
+            if current_ocr_mode in self.pdf_ocr_modes
+            else 0
         )
-        self.use_ocr_checkbox.SetToolTip(
-            "Select this to OCR PDF pages that have no selectable text. Leave "
-            "it cleared to use only existing selectable text. Table-aware "
-            "Word conversion is available only when OCR is cleared."
+        self.pdf_ocr_radio.SetToolTip(
+            "Choose whether PDF OCR is disabled, used only on pages without "
+            "selectable text, or used on every page. Table-aware Word "
+            "conversion is available with No OCR."
         )
-        self.use_ocr_checkbox.Bind(wx.EVT_CHECKBOX, self.on_use_ocr_toggle)
+        self.pdf_ocr_radio.Bind(wx.EVT_RADIOBOX, self.on_pdf_ocr_mode_change)
         self.document_import_btn = wx.Button(self.import_panel, label="Import Document")
         self.document_import_btn.Bind(wx.EVT_BUTTON, self.on_document_import)
         self.photo_import_btn = wx.Button(self.import_panel, label="Import Photo")
@@ -2941,7 +2962,7 @@ class ScanBox(wx.Frame):
             self.import_panel, label="Batch Import Photos"
         )
         import_sizer.Add(
-            self.use_ocr_checkbox, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
+            self.pdf_ocr_radio, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
         )
         import_sizer.Add(self.document_import_btn, 0, wx.ALL, 6)
         import_sizer.Add(self.photo_import_btn, 0, wx.ALL, 6)
@@ -4389,8 +4410,10 @@ class ScanBox(wx.Frame):
         except OSError:
             pass
 
-    def on_use_ocr_toggle(self, event):
-        self.app_settings["use_ocr_enabled"] = self.use_ocr_checkbox.GetValue()
+    def on_pdf_ocr_mode_change(self, event):
+        self.app_settings["pdf_ocr_mode"] = self.pdf_ocr_modes[
+            self.pdf_ocr_radio.GetSelection()
+        ]
         write_app_settings(self.app_settings)
         self.update_controls()
 
@@ -4482,7 +4505,7 @@ class ScanBox(wx.Frame):
         self.scan_save_images_btn.Enable(not interaction_locked)
         self.document_camera_btn.Enable(not interaction_locked)
         self.document_import_btn.Enable(not interaction_locked)
-        self.use_ocr_checkbox.Enable(not interaction_locked)
+        self.pdf_ocr_radio.Enable(not interaction_locked)
         self.photo_scan_btn.Enable(not interaction_locked)
         if hasattr(self, "photo_camera_btn"):
             self.photo_camera_btn.Enable(not interaction_locked)
@@ -6088,7 +6111,6 @@ class ScanBox(wx.Frame):
                 "Choose a PDF reading destination in Settings before importing "
                 "a PDF."
             )
-        use_ocr = self.app_settings.get("use_ocr_enabled", False)
         if fitz is None and sys.platform != "darwin":
             raise ValueError("PDF page reading support is not installed in ScanBox.")
 
@@ -6111,18 +6133,22 @@ class ScanBox(wx.Frame):
 
     def _process_pdf_worker(self, source, open_word):
         try:
-            use_ocr = self.app_settings.get("use_ocr_enabled", False)
+            ocr_mode = self.app_settings.get("pdf_ocr_mode", "none")
             if not open_word:
                 pages = (
-                    self.read_pdf_pages_with_native_ocr(source)
-                    if use_ocr
+                    self.read_pdf_pages_with_native_ocr(
+                        source, all_pages=ocr_mode == "all_pages"
+                    )
+                    if ocr_mode != "none"
                     else self.read_pdf_pages(source)
                 )
                 wx.CallAfter(self._finish_pdf_text, pages)
                 return
 
-            if use_ocr:
-                pages = self.read_pdf_pages_with_native_ocr(source)
+            if ocr_mode != "none":
+                pages = self.read_pdf_pages_with_native_ocr(
+                    source, all_pages=ocr_mode == "all_pages"
+                )
                 output_path = self.write_pdf_pages_to_docx(source, pages)
             else:
                 self.pdf_suitable_for_pdf2word(source)
@@ -6158,15 +6184,15 @@ class ScanBox(wx.Frame):
             if not has_selectable_text:
                 raise PdfNeedsOcrError(
                     "This PDF doesn't appear to contain any readable "
-                    "text without OCR. Select OCR Document upon import "
-                    "on the Import tab and try again."
+                    "text without OCR. Choose an OCR option on the Import tab "
+                    "and try again."
                 )
         return True
 
     def read_pdf_pages(self, source):
         """Return only existing selectable PDF text, without running OCR."""
         if sys.platform == "darwin":
-            return self.read_pdf_pages_macos(source, use_ocr=False)
+            return self.read_pdf_pages_macos(source, ocr_mode="none")
         pages = []
         with fitz.open(source) as pdf:
             if pdf.page_count == 0:
@@ -6178,15 +6204,16 @@ class ScanBox(wx.Frame):
         if not any(pages):
             raise PdfNeedsOcrError(
                 "This PDF doesn't appear to contain any readable text without "
-                "OCR. Select OCR Document upon import on the Import tab and "
-                "try again."
+                "OCR. Choose an OCR option on the Import tab and try again."
             )
         return pages
 
-    def read_pdf_pages_with_native_ocr(self, source):
+    def read_pdf_pages_with_native_ocr(self, source, all_pages=False):
         """Read scanned pages with Windows OCR or Apple Vision."""
         if sys.platform == "darwin":
-            return self.read_pdf_pages_macos(source, use_ocr=True)
+            return self.read_pdf_pages_macos(
+                source, ocr_mode="all_pages" if all_pages else "missing_text"
+            )
         pages = []
         with fitz.open(source) as pdf:
             if pdf.page_count == 0:
@@ -6194,7 +6221,7 @@ class ScanBox(wx.Frame):
             for index in range(pdf.page_count):
                 page = pdf.load_page(index)
                 selectable = page.get_text("text").strip()
-                if selectable:
+                if selectable and not all_pages:
                     pages.append(selectable)
                     continue
                 image_path = self.render_pdf_page(page, index)
@@ -6216,14 +6243,18 @@ class ScanBox(wx.Frame):
                 pages.append(text)
         return pages
 
-    def read_pdf_pages_macos(self, source, use_ocr=False):
+    def read_pdf_pages_macos(self, source, ocr_mode="none"):
         """Read PDF pages with PDFKit and, when requested, Apple Vision."""
         result = subprocess.run(
             [
                 MACOS_CAPTURE_HELPER,
                 "read-pdf",
                 source,
-                "ocr" if use_ocr else "text",
+                {
+                    "none": "text",
+                    "missing_text": "ocr-missing",
+                    "all_pages": "ocr-all",
+                }[ocr_mode],
             ],
             check=True,
             capture_output=True,
@@ -6238,16 +6269,15 @@ class ScanBox(wx.Frame):
             if kind != "page" or not separator:
                 continue
             text = base64.b64decode(encoded).decode("utf-8", errors="replace").strip()
-            if not text and use_ocr:
+            if not text and ocr_mode != "none":
                 text = "This page could not be read by Apple Vision."
             pages.append(text)
         if not pages:
             raise ValueError("the PDF contains no pages.")
-        if not use_ocr and not any(pages):
+        if ocr_mode == "none" and not any(pages):
             raise PdfNeedsOcrError(
                 "This PDF doesn't appear to contain any readable text without "
-                "OCR. Select OCR Document upon import on the Import tab and "
-                "try again."
+                "OCR. Choose an OCR option on the Import tab and try again."
             )
         return pages
 
