@@ -42,4 +42,15 @@ subprocess.run(
     check=True,
     cwd=root,
 )
-print(f"ScanBox for Windows: {root / 'dist' / 'ScanBox'}")
+app_dir = root / "dist" / "ScanBox"
+internal_dir = app_dir / "_internal"
+required_paths = [
+    app_dir / "ScanBox.exe",
+    internal_dir / "cv2" / "data" / "haarcascade_frontalface_default.xml",
+]
+missing = [str(path) for path in required_paths if not path.is_file()]
+if missing:
+    raise SystemExit("Windows build is missing required files: " + ", ".join(missing))
+if list(internal_dir.rglob("opencv_videoio_ffmpeg*")):
+    raise SystemExit("Windows build unexpectedly contains the unused FFmpeg backend.")
+print(f"ScanBox for Windows: {app_dir}")

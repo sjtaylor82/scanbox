@@ -1,10 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import cv2
 
 
 project = Path(SPECPATH).parent
 config_dir = project / "config"
+face_detector = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+if not face_detector.is_file():
+    raise SystemExit(
+        "OpenCV FaceAlign detector is missing. Use opencv-python-headless<5."
+    )
 
 datas = [
     (str(project / "manual.html"), "."),
@@ -12,6 +18,7 @@ datas = [
     (str(project / "SHUTTER.WAV"), "."),
     (str(config_dir / "vision_pack_florence2_base.json"), "config"),
     (str(config_dir / "vision_pack_qwen3_vl_2b.json"), "config"),
+    (str(face_detector), "cv2/data"),
     (str(project / "examples"), "examples"),
 ]
 

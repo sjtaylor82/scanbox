@@ -12,7 +12,8 @@ Pillow
 # these should be installed when building a fully featured end-user bundle.
 pywin32; sys_platform == "win32"  # Windows scanner/WIA support.
 numpy
-opencv-python-headless   # NOT opencv-python - ScanBox never shows any cv2
+opencv-python-headless<5 # OpenCV 5 wheels omit the Haar data FaceAlign uses.
+                         # NOT opencv-python - ScanBox never shows any cv2
                          # GUI window, and the headless build avoids extra
                          # Qt/GTK DLLs that PyInstaller-style builds can
                          # trip over.
