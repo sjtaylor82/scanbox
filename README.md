@@ -1,7 +1,7 @@
 ScanBox
 =======
 
-ScanBox 2026.8.0 is a privacy-first scanning, recognition, and image-description
+ScanBox 2026.9.0 is a privacy-first scanning, recognition, and image-description
 app for 64-bit Windows 10 and 11. A macOS 14-or-later test preview is also
 available.
 Documents, photographs, screenshots, OCR results, and AI descriptions are
@@ -143,6 +143,14 @@ Use a 64-bit Python environment. On Windows, install `requirements.txt`, then
 run:
 
   python scanbox.py
+
+To create an isolated, folder-based Windows build, run:
+
+  python packaging/build_windows.py
+
+The build script creates a private environment under `temp`, installs the
+declared runtime and packaging dependencies, and writes the application to
+`dist\ScanBox`.
 
 On macOS, install `requirements-macos.txt`. The native helper and application
 bundle must be built on a Mac with Xcode command-line tools available:

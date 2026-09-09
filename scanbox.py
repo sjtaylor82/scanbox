@@ -51,7 +51,7 @@ from fpdf import FPDF
 from PIL import Image, ImageGrab, ImageOps, UnidentifiedImageError
 
 APP_NAME = "ScanBox"
-APP_VERSION = "2026.8.0"
+APP_VERSION = "2026.9.0"
 UPDATE_MANIFEST_URL = os.environ.get(
     "SCANBOX_UPDATE_MANIFEST_URL",
     "https://api.github.com/repos/sjtaylor82/scanbox/releases/latest",
@@ -101,7 +101,11 @@ except ImportError:
 
 try:
     from pygrabber.dshow_graph import FilterGraph as _DirectShowFilterGraph
-except ImportError:
+except Exception:
+    # pygrabber initializes legacy DirectShow COM type libraries during
+    # import and can fail even when installed (for example, when its generated
+    # wrapper directory is not writable). Camera capture still works through
+    # OpenCV; only friendly DirectShow device names become unavailable.
     _DirectShowFilterGraph = None
 
 try:

@@ -25,6 +25,7 @@ build/
 dist/
 *.spec
 !packaging/ScanBox-macOS.spec
+!packaging/ScanBox-Windows.spec
 
 # Local macOS build and test artifacts
 .DS_Store
