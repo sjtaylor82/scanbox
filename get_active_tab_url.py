@@ -214,6 +214,11 @@ def download_active_browser_document_windows(
 def warm_up_active_tab_url_reader():
     """Initialize thread-affine Windows UI Automation before the first shortcut."""
     if sys.platform == "win32":
+        # This runs on ScanBox's dedicated browser-accessibility worker.
+        # UI Automation uses COM and therefore needs initialization on that
+        # worker thread, independently of wx's main-thread COM state.
+        import pythoncom
+        pythoncom.CoInitialize()
         from pywinauto import Desktop
         Desktop(backend="uia")
 

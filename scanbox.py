@@ -2929,9 +2929,11 @@ class ScanBox(wx.Frame):
             self.app_settings.get("use_ocr_enabled", False)
         )
         self.use_ocr_checkbox.SetToolTip(
-            "Select this for a scanned PDF that needs OCR. Leave it cleared "
-            "for a PDF that already contains selectable text so table-aware "
-            "conversion remains available. It does not affect photo imports."
+            "Select this to use native OCR for image-only PDF pages. Leave it "
+            "cleared for a PDF that already contains selectable text so "
+            "table-aware conversion remains available. An image-only page "
+            "is still read automatically when no selectable text is found. "
+            "This setting does not affect photo imports."
         )
         self.use_ocr_checkbox.Bind(wx.EVT_CHECKBOX, self.on_use_ocr_toggle)
         self.document_import_btn = wx.Button(self.import_panel, label="Import Document")
@@ -6315,12 +6317,21 @@ class ScanBox(wx.Frame):
             else:
                 rendered_pages.append(text)
         rendered = "\n\n".join(rendered_pages).strip()
-        if rendered and self.app_settings.get("render_converted_in_window", True):
+        displayed = bool(
+            rendered
+            and self.app_settings.get("render_converted_in_window", True)
+        )
+        if displayed:
             self.append_output(rendered + "\n\n")
-            announce("\n\n".join(pages))
         elif rendered:
             self.SetStatusText("PDF reading completed.")
         self.update_controls()
+        if displayed:
+            # begin_busy parks focus on the frame while the import control is
+            # disabled. Return it to the completed reading, matching the image
+            # and batch completion paths, so screen readers expose the result.
+            self.output_box.SetFocusFromKbd()
+            announce("\n\n".join(pages))
 
     def open_document_file(self, path):
         try:

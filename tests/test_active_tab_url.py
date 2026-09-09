@@ -1,3 +1,5 @@
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -7,6 +9,7 @@ from get_active_tab_url import (
     make_browser_download_request,
     normalize_web_url,
     open_with_browser_session,
+    warm_up_active_tab_url_reader,
 )
 
 
@@ -33,6 +36,24 @@ class NormalizeWebUrlTests(unittest.TestCase):
 
 
 class BrowserDownloadRequestTests(unittest.TestCase):
+    def test_windows_warmup_initializes_com_on_worker_thread(self):
+        events = []
+        pythoncom = types.ModuleType("pythoncom")
+        pythoncom.CoInitialize = lambda: events.append("com")
+        pywinauto = types.ModuleType("pywinauto")
+        pywinauto.Desktop = lambda **kwargs: events.append(
+            ("desktop", kwargs["backend"])
+        )
+
+        with mock.patch("get_active_tab_url.sys.platform", "win32"), \
+                mock.patch.dict(
+                    sys.modules,
+                    {"pythoncom": pythoncom, "pywinauto": pywinauto},
+                ):
+            warm_up_active_tab_url_reader()
+
+        self.assertEqual(events, ["com", ("desktop", "uia")])
+
     def test_uses_browser_headers_for_temporary_content_links(self):
         url = "https://example.dl.dropboxusercontent.com/cd/0/inline2/token/file"
         request = make_browser_download_request(url)
