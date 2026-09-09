@@ -753,7 +753,7 @@ struct ScanBoxMacHelper {
                         in: .whitespacesAndNewlines
                     )
                     var text = selectableText
-                    if useOCR {
+                    if text.isEmpty && useOCR {
                         let bounds = page.bounds(for: .mediaBox)
                         let target = NSSize(
                             width: max(1, bounds.width * 2),

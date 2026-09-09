@@ -34,7 +34,7 @@ Tabs
    - import a document image, PDF, photograph, or batch of photographs
    - press Control+Shift+hyphen while viewing a public HTTPS PDF in a supported
      browser to import it directly
-   - OCR Document upon import OCRs the whole PDF when selected
+   - OCR Document upon import OCRs pages without selectable text when selected
    - leave it cleared to use only existing selectable text; on Windows this
      also enables table-aware Word conversion
 

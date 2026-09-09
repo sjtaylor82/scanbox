@@ -2929,9 +2929,9 @@ class ScanBox(wx.Frame):
             self.app_settings.get("use_ocr_enabled", False)
         )
         self.use_ocr_checkbox.SetToolTip(
-            "Select this to OCR every PDF page. Leave it cleared to use only "
-            "existing selectable text. Table-aware Word conversion is "
-            "available only when OCR is cleared."
+            "Select this to OCR PDF pages that have no selectable text. Leave "
+            "it cleared to use only existing selectable text. Table-aware "
+            "Word conversion is available only when OCR is cleared."
         )
         self.use_ocr_checkbox.Bind(wx.EVT_CHECKBOX, self.on_use_ocr_toggle)
         self.document_import_btn = wx.Button(self.import_panel, label="Import Document")
@@ -6194,6 +6194,9 @@ class ScanBox(wx.Frame):
             for index in range(pdf.page_count):
                 page = pdf.load_page(index)
                 selectable = page.get_text("text").strip()
+                if selectable:
+                    pages.append(selectable)
+                    continue
                 image_path = self.render_pdf_page(page, index)
                 try:
                     if sys.platform == "darwin":
