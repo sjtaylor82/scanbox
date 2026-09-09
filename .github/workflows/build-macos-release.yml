@@ -1,0 +1,77 @@
+name: Build macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub release tag to build and update
+        required: true
+        default: v2026.9.0
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-macos.txt
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip "setuptools<70" wheel
+          python -m pip install -r requirements-macos.txt
+
+      - name: Build macOS app bundle
+        run: python packaging/build_macos.py
+
+      - name: Validate app bundle
+        run: |
+          APP="$HOME/Library/Caches/ScanBox/dist/ScanBox.app"
+          test -x "$APP/Contents/MacOS/ScanBox"
+          test -x "$APP/Contents/Resources/macos/scanbox-macos-helper"
+          test -f "$APP/Contents/Resources/manual.html"
+          test -f "$APP/Contents/Resources/LICENSE"
+          test -f "$APP/Contents/Resources/SHUTTER.WAV"
+          test -f "$APP/Contents/Resources/config/vision_pack_qwen3_vl_2b.json"
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Package macOS release
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          APP="$HOME/Library/Caches/ScanBox/dist/ScanBox.app"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "ScanBox-${VERSION}-macOS.zip"
+          shasum -a 256 "ScanBox-${VERSION}-macOS.zip"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScanBox-macOS-${{ inputs.release_tag }}
+          path: ScanBox-*-macOS.zip
+          if-no-files-found: error
+
+      - name: Attach bundle to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          gh release upload "$RELEASE_TAG" "ScanBox-${VERSION}-macOS.zip" --clobber
