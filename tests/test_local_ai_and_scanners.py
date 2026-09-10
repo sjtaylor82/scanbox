@@ -229,7 +229,35 @@ class ExternalAiRegressionTests(unittest.TestCase):
                     text = scanbox.ScanBox._read_screen_text(SimpleNamespace(app_settings=self.settings), "screen.png", use_vision_fallback=True, cancel_event=cancel)
                     self.assertEqual(text, scanbox.PHOTO_DESCRIPTION_CANCELLED)
                     native.assert_not_called()
-                    self.assertEqual(external.called, not already_cancelled)
+                self.assertEqual(external.called, not already_cancelled)
+
+    def test_screen_question_uses_focusable_screen_processing_state(self):
+        frame = SimpleNamespace(
+            app_settings=self.settings.copy(),
+            _restore_after_screen_question=mock.Mock(),
+            _begin_screen_processing=mock.Mock(),
+            _screen_question_worker=mock.Mock(),
+            last_active_mode="document",
+        )
+        dialog = mock.Mock()
+        dialog.ShowModal.return_value = scanbox.wx.ID_OK
+        question = mock.Mock()
+        question.GetValue.return_value = "What is shown?"
+        worker = mock.Mock()
+        with (
+            mock.patch.object(scanbox.wx, "Dialog", return_value=dialog),
+            mock.patch.object(scanbox.wx, "BoxSizer", return_value=mock.Mock()),
+            mock.patch.object(scanbox.wx, "StaticText"),
+            mock.patch.object(scanbox.wx, "TextCtrl", return_value=question),
+            mock.patch.object(scanbox.wx, "CallAfter", side_effect=lambda callback, *args: callback(*args)),
+            mock.patch.object(scanbox.threading, "Thread", return_value=worker),
+            mock.patch.object(scanbox, "play_shutter_sound"),
+            mock.patch.object(scanbox, "_find_mtmd_model_files", return_value=None),
+        ):
+            scanbox.ScanBox._ask_screen_question(frame, "screen.png")
+
+        frame._begin_screen_processing.assert_called_once_with()
+        worker.start.assert_called_once_with()
 
 
 class ScannerSelectionTests(unittest.TestCase):

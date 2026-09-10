@@ -14,12 +14,16 @@ from version_resource import (
 
 root = Path(__file__).resolve().parent.parent
 venv_dir = root / "temp" / "windows-build-venv"
-venv_python = venv_dir / "Scripts" / "python.exe"
+venv_python = (
+    Path(sys.executable)
+    if os.environ.get("SCANBOX_USE_CURRENT_BUILD_ENV") == "1"
+    else venv_dir / "Scripts" / "python.exe"
+)
 
 if os.name != "nt":
     raise SystemExit("The Windows build must be created on Windows.")
 
-if not venv_python.is_file():
+if os.environ.get("SCANBOX_USE_CURRENT_BUILD_ENV") != "1" and not venv_python.is_file():
     subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
 
 if os.environ.get("SCANBOX_SKIP_BUILD_INSTALL") != "1":

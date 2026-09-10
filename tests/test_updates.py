@@ -136,6 +136,7 @@ class UpdateTests(unittest.TestCase):
             if success:
                 self.assertFalse((install / "_internal/old.dll").exists())
                 self.assertTrue((install / "_internal/new.dll").exists())
+                self.assertEqual(list(install.glob(".update-backup-*")), [])
                 self.assertIn("Update completed", log.read_text(encoding="utf-8-sig"))
             else:
                 self.assertIn("Update failed", log.read_text(encoding="utf-8-sig"))
@@ -143,7 +144,7 @@ class UpdateTests(unittest.TestCase):
                 if locked:
                     self.assertIn("Previous application restored", log.read_text(encoding="utf-8-sig"))
 
-    def test_prunes_superseded_backups_but_keeps_the_newest_and_user_data(self):
+    def test_prunes_all_update_backups_and_keeps_user_data(self):
         with tempfile.TemporaryDirectory() as directory:
             install = Path(directory)
             (install / "ScanBox.exe").write_text("app")
@@ -168,10 +169,7 @@ class UpdateTests(unittest.TestCase):
             ):
                 scanbox._prune_superseded_update_backups()
 
-            # Only the most recently written rollback copy survives.
-            self.assertTrue(backups[2].is_dir())
-            self.assertFalse(backups[0].exists())
-            self.assertFalse(backups[1].exists())
+            self.assertTrue(all(not backup.exists() for backup in backups))
             self.assertFalse(staging.exists())
             self.assertTrue((install / "ScanBox.exe").is_file())
             self.assertTrue((install / "_internal").is_dir())

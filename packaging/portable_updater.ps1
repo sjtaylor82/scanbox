@@ -18,6 +18,7 @@ $oldItems = New-Object System.Collections.Generic.List[string]
 $newItems = New-Object System.Collections.Generic.List[string]
 $closed = $false
 $success = $false
+$host.UI.RawUI.WindowTitle = "ScanBox Portable Update"
 
 function Write-UpdateLog([string]$Message) {
     Add-Content -LiteralPath $LogPath -Value ("[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message") -Encoding UTF8
@@ -25,6 +26,7 @@ function Write-UpdateLog([string]$Message) {
 
 try {
     Write-UpdateLog "Preparing update for $appRoot from $PayloadPath"
+    Write-Host "Preparing the ScanBox update."
     if (-not (Test-Path -LiteralPath (Join-Path $PayloadPath 'ScanBox.exe') -PathType Leaf) -or
         -not (Test-Path -LiteralPath (Join-Path $PayloadPath '_internal') -PathType Container)) {
         throw 'The update is missing ScanBox.exe or its _internal folder.'
@@ -37,10 +39,12 @@ try {
         Copy-Item -LiteralPath (Join-Path $PayloadPath $name) -Destination $stage -Recurse -Force
     }
     Write-UpdateLog 'Preparation complete; waiting for ScanBox to close.'
+    Write-Host "Preparation complete. ScanBox will close before files are replaced."
     Set-Content -LiteralPath $ReadyPath -Value 'ready' -Encoding ASCII
     # ScanBox may have exited before PowerShell reaches this instruction.
     Wait-Process -Id $ScanBoxProcessId -ErrorAction SilentlyContinue
     $closed = $true
+    Write-Host "Installing the ScanBox update. Please keep this window open."
     foreach ($name in @('ScanBox.exe', '_internal')) {
         $destination = Join-Path $appRoot $name
         if (Test-Path -LiteralPath $destination) {
@@ -53,11 +57,21 @@ try {
     $success = $true
     # The staging folder is empty once both items have been moved into place.
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-    Write-UpdateLog "Update completed. Previous application retained at $backup"
+    try {
+        Remove-Item -LiteralPath $backup -Recurse -Force
+        Write-UpdateLog "Update completed. Previous application files removed."
+        Write-Host "Old application files removed."
+    } catch {
+        # The new application is already installed. Do not roll it back solely
+        # because antivirus or indexing briefly held a file in the backup.
+        Write-UpdateLog "Update completed, but old application cleanup will be retried at startup: $($_.Exception.Message)"
+    }
+    Write-Host "Update complete. Restarting ScanBox."
 } catch {
     $failure = $_.Exception.Message
     $env:SCANBOX_UPDATE_FAILED = $LogPath
     Write-UpdateLog "Update failed: $failure"
+    Write-Host "The ScanBox update failed: $failure"
     if ($closed) {
         try {
             foreach ($name in $newItems) {

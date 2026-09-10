@@ -1,7 +1,7 @@
 ScanBox
 =======
 
-ScanBox 2026.9.5 is a privacy-first scanning, recognition, and image-description
+ScanBox 2026.9.6 is a privacy-first scanning, recognition, and image-description
 app for 64-bit Windows 10 and 11. A macOS 14-or-later test preview is also
 available.
 Documents, photographs, screenshots, OCR results, and AI descriptions are

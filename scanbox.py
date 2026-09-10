@@ -55,7 +55,7 @@ from fpdf import FPDF
 from PIL import Image, ImageGrab, ImageOps, UnidentifiedImageError
 
 APP_NAME = "ScanBox"
-APP_VERSION = "2026.9.5"
+APP_VERSION = "2026.9.6"
 UPDATE_MANIFEST_URL = os.environ.get(
     "SCANBOX_UPDATE_MANIFEST_URL",
     "https://api.github.com/repos/sjtaylor82/scanbox/releases/latest",
@@ -110,30 +110,16 @@ def _prepare_update_payload(archive_path, platform_name=None):
 
 
 def _prune_superseded_update_backups():
-    """Keep one rollback copy of the previous build and remove the rest.
-
-    Every portable update retains the application it replaced, which is around
-    300 MB on Windows. Retaining all of them would grow without limit, so keep
-    only the newest and discard abandoned staging folders.
-    """
+    """Remove abandoned update staging and rollback copies."""
     if not getattr(sys, "frozen", False):
         return
     if sys.platform == "win32":
         parent = Path(BASE)
-        backups = sorted(
-            parent.glob(".update-backup-*"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        stale = list(parent.glob(".update-new-*")) + backups[1:]
+        stale = (list(parent.glob(".update-new-*"))
+                 + list(parent.glob(".update-backup-*")))
     elif sys.platform == "darwin":
         current_app = Path(sys.executable).resolve().parents[2]
-        backups = sorted(
-            current_app.parent.glob(current_app.name + ".previous-*"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        stale = backups[1:]
+        stale = list(current_app.parent.glob(current_app.name + ".previous-*"))
     else:
         return
     for path in stale:
@@ -164,18 +150,17 @@ def _launch_portable_updater(payload_path):
         with open(script_path, "w", encoding="utf-8-sig") as script_file:
             script_file.write(script)
         logger.info("Starting portable updater; update log: %s", log_path)
-        with open(log_path, "ab") as update_log:
-            helper = subprocess.Popen(
-                [
-                    "powershell.exe", "-NoProfile", "-NonInteractive",
-                    "-ExecutionPolicy", "Bypass", "-File", script_path,
-                    "-ScanBoxProcessId", str(process_id),
-                    "-PayloadPath", payload_path, "-AppDirectory", install_dir,
-                    "-ReadyPath", ready_path, "-LogPath", log_path,
-                ],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                close_fds=True, stdout=update_log, stderr=subprocess.STDOUT,
-            )
+        helper = subprocess.Popen(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive",
+                "-ExecutionPolicy", "Bypass", "-File", script_path,
+                "-ScanBoxProcessId", str(process_id),
+                "-PayloadPath", payload_path, "-AppDirectory", install_dir,
+                "-ReadyPath", ready_path, "-LogPath", log_path,
+            ],
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            close_fds=True,
+        )
         deadline = time.monotonic() + 300
         while not os.path.isfile(ready_path):
             if helper.poll() is not None:
@@ -4388,6 +4373,7 @@ class ScanBox(wx.Frame):
         """Download and stage a portable update without blocking the UI."""
         self.check_updates_item.Enable(False)
         self.SetStatusText(f"Downloading ScanBox {latest_version}...")
+        self._show_update_progress_dialog(latest_version)
         threading.Thread(
             target=self._update_download_worker,
             args=(latest_version, download_url),
@@ -4405,7 +4391,7 @@ class ScanBox(wx.Frame):
                 download_url,
                 archive_path,
                 "ScanBox update",
-                lambda message: wx.CallAfter(self.SetStatusText, message),
+                lambda message: wx.CallAfter(self._update_download_progress, message),
             )
             payload_path = _prepare_update_payload(archive_path)
             _launch_portable_updater(payload_path)
@@ -4416,6 +4402,7 @@ class ScanBox(wx.Frame):
         wx.CallAfter(self._finish_update_download, *result)
 
     def _finish_update_download(self, payload_path, error):
+        self._close_update_progress_dialog()
         self.check_updates_item.Enable(True)
         if error:
             self.SetStatusText("ScanBox update failed.")
@@ -4429,6 +4416,36 @@ class ScanBox(wx.Frame):
         self.SetStatusText("Update ready. Restarting ScanBox...")
         self._close_after_announcement = True
         self.Close()
+
+    def _show_update_progress_dialog(self, version):
+        """Show a focused native gauge that screen readers can follow."""
+        dialog = wx.Dialog(self, title="Downloading ScanBox Update")
+        root = wx.BoxSizer(wx.VERTICAL)
+        label = wx.StaticText(dialog, label=f"Downloading ScanBox {version}…")
+        gauge = wx.Gauge(dialog, range=100, style=wx.GA_HORIZONTAL)
+        gauge.SetName("ScanBox update download progress")
+        root.Add(label, 0, wx.ALL | wx.EXPAND, 12)
+        root.Add(gauge, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, 12)
+        dialog.SetSizerAndFit(root)
+        dialog.CentreOnParent()
+        self._update_progress_dialog = dialog
+        self._update_progress_gauge = gauge
+        dialog.Show()
+        wx.CallAfter(gauge.SetFocusFromKbd)
+
+    def _update_download_progress(self, message):
+        self.SetStatusText(message)
+        match = re.search(r":\s*(\d+)%", message)
+        gauge = getattr(self, "_update_progress_gauge", None)
+        if gauge is not None and match:
+            gauge.SetValue(max(0, min(100, int(match.group(1)))))
+
+    def _close_update_progress_dialog(self):
+        dialog = getattr(self, "_update_progress_dialog", None)
+        self._update_progress_dialog = None
+        self._update_progress_gauge = None
+        if dialog is not None:
+            dialog.Destroy()
 
     def on_mode_change(self, event):
         selected_tab = self.mode_tabs.GetSelection()
@@ -4683,8 +4700,10 @@ class ScanBox(wx.Frame):
         logger.info("Ask ScanBox question submitted")
         play_shutter_sound()
         self.last_active_mode = "photo"
-        self.busy = True
-        self.update_controls()
+        # Use the same focusable in-progress state as Ctrl+Backslash. This
+        # keeps Results enabled, shows Processing..., and lets on_activate()
+        # move focus there if the user returns to ScanBox while inference runs.
+        self._begin_screen_processing()
         threading.Thread(
             target=self._screen_question_worker,
             args=(path, query),
@@ -8398,6 +8417,10 @@ class ScanBox(wx.Frame):
         dlg.Fit()
 
         try:
+            # ShowModal assigns focus to the default OK button while opening.
+            # Move it back after the dialog enters its event loop so keyboard
+            # and screen-reader users start on the Settings tab bar.
+            wx.CallAfter(notebook.SetFocus)
             if dlg.ShowModal() == wx.ID_OK:
                 self.app_settings["delete_output_files_on_exit"] = delete_output.GetValue()
                 self.app_settings["check_for_updates_on_startup"] = (

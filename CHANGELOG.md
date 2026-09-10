@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026.9.6
+
+- Make portable Windows updates easier to follow with an accessible download
+  progress dialog and a visible, titled PowerShell installation window.
+- Remove rollback copies after a successful portable update and clear legacy
+  update backups on startup instead of retaining an entire previous build.
+- Put initial keyboard focus on the Settings tab bar instead of the OK button.
+- Keep ScanBox responsive and its Results area focusable while an active-window
+  question is being answered, matching the active-window description workflow.
+
 ## 2026.9.5
 
 - Add a saved default-camera selector to Settings, used by document capture,
