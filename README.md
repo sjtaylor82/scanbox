@@ -1,7 +1,7 @@
 ScanBox
 =======
 
-ScanBox 2026.9.4 is a privacy-first scanning, recognition, and image-description
+ScanBox 2026.9.5 is a privacy-first scanning, recognition, and image-description
 app for 64-bit Windows 10 and 11. A macOS 14-or-later test preview is also
 available.
 Documents, photographs, screenshots, OCR results, and AI descriptions are
@@ -122,15 +122,16 @@ Another local AI
 Settings > AI can connect ScanBox to AI software already running on this
 computer. Choose "Another local AI on this computer", then choose Find Local
 AI. ScanBox lists every model returned by detected Ollama, LM Studio and vLLM
-services; select the one to use. Scans, camera captures, imported images and
-screenshots remain handled by ScanBox, while document OCR, descriptions and
-image questions are sent to the selected loopback service. If no service is
-detected, advanced server-address and model-name fields become available.
+services; select the one to use. A private IP address, port, API type, optional
+API key and model name can also be entered for a service on this computer or
+the local network. Scans, camera captures, imported images and screenshots
+remain handled by ScanBox, while document OCR, descriptions and image questions
+are sent to the selected service.
 
-External local AI addresses are restricted to localhost and built-in ScanBox
-AI remains the default. The selected local service controls its own network and
-privacy behaviour, so configure that service separately if it can use cloud
-providers.
+External local AI addresses are restricted to localhost and private-network
+addresses, and built-in ScanBox AI remains the default. The selected local
+service controls its own network and privacy behaviour, so configure that
+service separately if it can use cloud providers.
 
 Screen workflows
 ----------------

@@ -82,9 +82,10 @@ Press <kbd>F1</kbd> at any time to open this guide.</p>
   <li><strong>FaceAlign</strong> announces the position of your face in a front-facing camera.</li>
 </ul>
 
-<p>These commands are the same on Windows and macOS. The Scanner page in
-Settings lists every detected scanner. Choose one to use it directly, or choose
-<strong>Ask me each time</strong> to select during the scan workflow.</p>
+<p>These commands are the same on Windows and macOS. The Scanner and Camera
+pages in Settings list the detected devices. Choose a default device to use it
+throughout ScanBox, or choose <strong>Ask me each time</strong> to select it
+during a workflow.</p>
 
 <h3>Camera timing</h3>
 
@@ -158,15 +159,17 @@ graphics processor used by the current or most recent description.</p>
 
 <h3>Another local AI</h3>
 
-<p>If Ollama, LM Studio or vLLM is already running on this computer, choose
+<p>If Ollama, LM Studio or vLLM is already running locally, choose
 <strong>Another local AI on this computer</strong>, then choose
 <strong>Find Local AI</strong>. ScanBox lists every model returned by every
 detected service. Select the model you want to use for document OCR, image
-descriptions and image questions.</p>
+descriptions and image questions. To use a nonstandard connection such as port
+8001, enter its private IP address, port, API type and optional API key before
+finding models.</p>
 
-<p>ScanBox restricts these connections to this computer, and built-in ScanBox
-AI remains the default. The selected local service controls its own network and
-privacy behaviour.</p>
+<p>ScanBox restricts these connections to this computer or a private-network
+address, and built-in ScanBox AI remains the default. The selected local
+service controls its own network and privacy behaviour.</p>
 
 <h2 id="other-apps">7. Describe Another Application</h2>
 

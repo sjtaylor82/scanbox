@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Existing GitHub release tag to build and update
         required: true
-        default: v2026.9.4
+        default: v2026.9.5
 
 permissions:
   contents: write

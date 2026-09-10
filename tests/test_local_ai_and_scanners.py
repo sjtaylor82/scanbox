@@ -171,7 +171,7 @@ class ExternalAiRegressionTests(unittest.TestCase):
                     self.assertEqual(image.getpixel((0, 0)), (255, 0, 0))
                 self.assertEqual(path.read_bytes(), original)
 
-    def test_truncated_document_uses_native_fallback_for_both_providers(self):
+    def test_truncated_document_keeps_returned_text_for_both_providers(self):
         for kind in ("openai", "ollama"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "page.png"
@@ -186,8 +186,29 @@ class ExternalAiRegressionTests(unittest.TestCase):
                     mock.patch.object(scanbox, "windows_ocr", return_value="Complete native page") as native,
                 ):
                     text = scanbox.ScanBox.process_document(SimpleNamespace(app_settings=settings), path, detect_page=False)
-                self.assertEqual(text, "Complete native page")
-                native.assert_called_once()
+                self.assertTrue(text.startswith("Partial page"))
+                self.assertIn("output token limit", text)
+                native.assert_not_called()
+
+    def test_custom_port_discovery_and_api_key(self):
+        responses = [
+            JsonResponse(json.dumps({"data": [{"id": "deepseek-ocr"}]}).encode()),
+            JsonResponse(json.dumps({"models": []}).encode()),
+        ]
+        with mock.patch.object(
+            scanbox.urllib.request, "urlopen", side_effect=responses
+        ) as urlopen:
+            found = scanbox.discover_local_ai_models_at(
+                "http://127.0.0.1:8001", "secret"
+            )
+        requests = [call.args[0] for call in urlopen.call_args_list]
+        self.assertEqual(
+            {request.full_url for request in requests},
+            {"http://127.0.0.1:8001/v1/models", "http://127.0.0.1:8001/api/tags"},
+        )
+        self.assertTrue(all(request.get_header("Authorization") == "Bearer secret"
+                            for request in requests))
+        self.assertEqual(found[0]["model"], "deepseek-ocr")
 
     def test_screen_ocr_prefers_selected_provider_and_falls_back_on_failure(self):
         for answer, expected in (("A complete external screen transcription", "A complete external screen transcription"),
@@ -279,6 +300,32 @@ class ScannerSelectionTests(unittest.TestCase):
 
 
 class CameraCaptureTests(unittest.TestCase):
+    def test_saved_camera_is_used_without_prompting(self):
+        frame = SimpleNamespace(app_settings={"camera_index": 2})
+        frame.available_camera_indexes = mock.Mock(return_value=[0, 2])
+        frame.camera_device_names = mock.Mock(return_value={0: "Webcam", 2: "Document camera"})
+        with mock.patch.object(scanbox.wx, "Dialog") as dialog:
+            selected = scanbox.ScanBox.choose_camera(frame)
+        self.assertEqual(selected, 2)
+        dialog.assert_not_called()
+
+    def test_missing_saved_camera_does_not_choose_another(self):
+        frame = SimpleNamespace(app_settings={"camera_index": 2, "camera_name": "Document camera"})
+        frame.available_camera_indexes = mock.Mock(return_value=[0])
+        frame.camera_device_names = mock.Mock(return_value={0: "Webcam"})
+        with mock.patch.object(scanbox.wx, "MessageBox") as message:
+            selected = scanbox.ScanBox.choose_camera(frame)
+        self.assertIsNone(selected)
+        message.assert_called_once()
+
+    def test_saved_camera_is_relocated_by_name_after_reordering(self):
+        frame = SimpleNamespace(app_settings={"camera_index": 2, "camera_name": "Document camera"})
+        frame.available_camera_indexes = mock.Mock(return_value=[0, 1])
+        frame.camera_device_names = mock.Mock(
+            return_value={0: "Document camera", 1: "Webcam"}
+        )
+        self.assertEqual(scanbox.ScanBox.choose_camera(frame), 0)
+
     def test_blank_bridge_frames_are_rejected(self):
         blank = np.zeros((10, 10, 3), dtype=np.uint8)
         white = np.full((10, 10, 3), 255, dtype=np.uint8)

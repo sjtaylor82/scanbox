@@ -22,20 +22,21 @@ if os.name != "nt":
 if not venv_python.is_file():
     subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
 
-subprocess.run(
-    [
-        str(venv_python),
-        "-m",
-        "pip",
-        "install",
-        "--disable-pip-version-check",
-        "-r",
-        str(root / "requirements.txt"),
-        "pyinstaller",
-    ],
-    check=True,
-    cwd=root,
-)
+if os.environ.get("SCANBOX_SKIP_BUILD_INSTALL") != "1":
+    subprocess.run(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "-r",
+            str(root / "requirements.txt"),
+            "pyinstaller",
+        ],
+        check=True,
+        cwd=root,
+    )
 subprocess.run(
     [
         str(venv_python),

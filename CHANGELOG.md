@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026.9.5
+
+- Add a saved default-camera selector to Settings, used by document capture,
+  photo description, and FaceAlign.
+- Let users find local AI models at a chosen private IP address and port, with
+  an optional API key for authenticated OpenAI-compatible services.
+- Keep text returned by a local AI service when it reaches its output-token
+  limit, and clearly mark that text as potentially incomplete.
+
 ## 2026.9.4
 
 - Asking Windows for the active application's version now answers

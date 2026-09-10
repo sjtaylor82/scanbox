@@ -2,6 +2,7 @@ import ctypes
 from ctypes import wintypes
 import base64
 import io
+import ipaddress
 from collections import Counter
 import asyncio
 import json
@@ -54,7 +55,7 @@ from fpdf import FPDF
 from PIL import Image, ImageGrab, ImageOps, UnidentifiedImageError
 
 APP_NAME = "ScanBox"
-APP_VERSION = "2026.9.4"
+APP_VERSION = "2026.9.5"
 UPDATE_MANIFEST_URL = os.environ.get(
     "SCANBOX_UPDATE_MANIFEST_URL",
     "https://api.github.com/repos/sjtaylor82/scanbox/releases/latest",
@@ -394,6 +395,8 @@ DEFAULT_APP_SETTINGS = {
     "camera_interval_seconds": 5,
     # Zero means repeat until the user chooses Stop Camera Capture.
     "camera_capture_count": 1,
+    "camera_index": -1,
+    "camera_name": "Ask me each time",
     "scanner_id": "",
     "scanner_name": "Ask me each time",
     "vision_model": DEFAULT_VISION_MODEL_ID,
@@ -402,6 +405,7 @@ DEFAULT_APP_SETTINGS = {
     "external_ai_url": "",
     "external_ai_model": "",
     "external_ai_label": "",
+    "external_ai_api_key": "",
     "mac_permissions_prompted": False,
 }
 
@@ -851,14 +855,31 @@ LOCAL_AI_SERVICES = (
 
 
 def _normalise_local_ai_url(url):
-    """Validate a loopback-only AI service URL and remove trailing slashes."""
+    """Validate a local/private AI service URL and remove trailing slashes."""
     value = str(url or "").strip().rstrip("/")
+    if value and "://" not in value:
+        value = "http://" + value
     parsed = urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
-        "127.0.0.1", "localhost", "::1",
-    }:
+    hostname = parsed.hostname or ""
+    try:
+        local_host = hostname.casefold() == "localhost" or ipaddress.ip_address(
+            hostname
+        ).is_private or ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        local_host = False
+    if parsed.scheme not in {"http", "https"} or not local_host:
         return ""
     return value
+
+
+def _local_ai_url_with_port(address, port):
+    """Build a local service URL from an address field and explicit port."""
+    value = _normalise_local_ai_url(address)
+    if not value:
+        return ""
+    parsed = urlsplit(value)
+    host = f"[{parsed.hostname}]" if ":" in (parsed.hostname or "") else parsed.hostname
+    return parsed._replace(netloc=f"{host}:{int(port)}").geturl().rstrip("/")
 
 
 def _local_ai_kind_for_url(url):
@@ -884,15 +905,19 @@ def external_ai_config(settings=None):
         "name": settings.get("external_ai_label", "Local AI") or "Local AI",
         "url": url,
         "model": model,
+        "api_key": settings.get("external_ai_api_key", "").strip(),
     }
 
 
 def _probe_local_ai_service(service, timeout=1.5):
     """Return every model advertised by one known local AI service."""
     try:
+        headers = {"User-Agent": f"ScanBox/{APP_VERSION}"}
+        if service.get("api_key"):
+            headers["Authorization"] = f"Bearer {service['api_key']}"
         request = urllib.request.Request(
             service["models_url"],
-            headers={"User-Agent": f"ScanBox/{APP_VERSION}"},
+            headers=headers,
         )
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.load(response)
@@ -946,6 +971,27 @@ def discover_local_ai_models(timeout=1.5):
                 seen.add(identity)
                 found.append(item)
     return found
+
+
+def discover_local_ai_models_at(url, api_key="", timeout=3):
+    """Discover models at a user-supplied local/private service address."""
+    base_url = _normalise_local_ai_url(url)
+    if not base_url:
+        return []
+    openai_url = base_url
+    if urlsplit(openai_url).path in {"", "/"}:
+        openai_url += "/v1"
+    services = (
+        {"kind": "openai", "name": "Local AI", "base_url": openai_url,
+         "models_url": openai_url + "/models", "api_key": api_key},
+        {"kind": "ollama", "name": "Ollama", "base_url": base_url,
+         "models_url": base_url + "/api/tags", "api_key": api_key},
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        groups = list(executor.map(
+            lambda service: _probe_local_ai_service(service, timeout), services
+        ))
+    return [item for group in groups for item in group]
 
 
 def _external_ai_prompt(task, prompt_override=None):
@@ -1013,13 +1059,16 @@ def run_external_ai_task(
                 "max_tokens": max_tokens,
                 "temperature": 0,
             }
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": f"ScanBox/{APP_VERSION}",
+        }
+        if config.get("api_key"):
+            headers["Authorization"] = f"Bearer {config['api_key']}"
         request = urllib.request.Request(
             endpoint,
             data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": f"ScanBox/{APP_VERSION}",
-            },
+            headers=headers,
         )
         with urllib.request.urlopen(
             request, timeout=MTMD_TIMEOUT_SECONDS
@@ -1028,15 +1077,18 @@ def run_external_ai_task(
         if cancel_event is not None and cancel_event.is_set():
             return PHOTO_DESCRIPTION_CANCELLED
         if config["kind"] == "ollama":
-            if result.get("done_reason") == "length" or result.get("done") is False:
-                return "Local AI service returned incomplete text; the result was not used."
             text = str(result.get("message", {}).get("content", "")).strip()
+            truncated = result.get("done_reason") == "length" or result.get("done") is False
         else:
-            if result.get("choices", [{}])[0].get("finish_reason") == "length":
-                return "Local AI service returned incomplete text; the result was not used."
             text = str(
                 result.get("choices", [{}])[0].get("message", {}).get("content", "")
             ).strip()
+            truncated = result.get("choices", [{}])[0].get("finish_reason") == "length"
+        if truncated and text:
+            logger.warning("Local AI output reached its token limit service=%s model=%s", config["name"], config["model"])
+            return text + "\n\n[The local AI reached its output token limit; this result may be incomplete.]"
+        if truncated:
+            return "Local AI service reached its output token limit and returned no text."
         return text or "Local AI service returned no text."
     except Exception as exc:
         logger.exception(
@@ -5982,56 +6034,60 @@ class ScanBox(wx.Frame):
             )
             return None
 
-        selected_index = available[0]
-        if len(available) > 1:
-            device_names = self.camera_device_names()
-            raw_labels = [
-                device_names.get(index, f"Camera {index + 1}")
-                for index in available
-            ]
-            labels = [
-                (
-                    f"{name} (Camera {index + 1})"
-                    if raw_labels.count(name) > 1
-                    else name
-                )
-                for index, name in zip(available, raw_labels)
-            ]
-            dialog = wx.Dialog(self, title="Select Camera")
-            root = wx.BoxSizer(wx.VERTICAL)
-            explanation = wx.StaticText(
-                dialog,
-                label=(
-                    "Choose the camera facing you."
-                    if front_facing_only
-                    else "Choose the camera to use."
-                ),
+        saved_index = self.app_settings.get("camera_index", -1)
+        saved_name = self.app_settings.get("camera_name", "")
+        device_names = self.camera_device_names() if saved_index != -1 else {}
+        if saved_index in available and (
+            not saved_name or not device_names
+            or device_names.get(saved_index) == saved_name
+        ):
+            return saved_index
+        matching_indexes = [
+            index for index in available if device_names.get(index) == saved_name
+        ]
+        if len(matching_indexes) == 1:
+            return matching_indexes[0]
+        if saved_index != -1:
+            wx.MessageBox(
+                "The camera selected in Settings is not currently available. "
+                "Connect it or choose another camera in Settings.",
+                "Camera unavailable",
             )
-            camera_label = wx.StaticText(dialog, label="Camera")
-            camera_choice = wx.ComboBox(
-                dialog,
-                choices=labels,
-                style=wx.CB_READONLY,
-            )
-            camera_choice.SetName("Camera")
-            camera_choice.SetSelection(0)
-            root.Add(explanation, 0, wx.ALL | wx.EXPAND, 10)
-            root.Add(camera_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
-            root.Add(camera_choice, 0, wx.ALL | wx.EXPAND, 10)
-            root.Add(
-                dialog.CreateButtonSizer(wx.OK | wx.CANCEL),
-                0,
-                wx.ALL | wx.ALIGN_RIGHT,
-                10,
-            )
-            dialog.SetSizerAndFit(root)
-            try:
-                if dialog.ShowModal() != wx.ID_OK:
-                    return None
-                selected_index = available[camera_choice.GetSelection()]
-            finally:
-                dialog.Destroy()
-        return selected_index
+            return None
+
+        if len(available) == 1:
+            return available[0]
+        device_names = self.camera_device_names()
+        raw_labels = [
+            device_names.get(index, f"Camera {index + 1}") for index in available
+        ]
+        labels = [
+            f"{name} (Camera {index + 1})" if raw_labels.count(name) > 1 else name
+            for index, name in zip(available, raw_labels)
+        ]
+        dialog = wx.Dialog(self, title="Select Camera")
+        root = wx.BoxSizer(wx.VERTICAL)
+        explanation = wx.StaticText(
+            dialog,
+            label=("Choose the camera facing you." if front_facing_only
+                   else "Choose the camera to use."),
+        )
+        camera_choice = wx.RadioBox(
+            dialog, label="Camera", choices=labels, majorDimension=1,
+            style=wx.RA_SPECIFY_ROWS,
+        )
+        camera_choice.SetSelection(0)
+        root.Add(explanation, 0, wx.ALL | wx.EXPAND, 10)
+        root.Add(camera_choice, 0, wx.ALL | wx.EXPAND, 10)
+        root.Add(dialog.CreateButtonSizer(wx.OK | wx.CANCEL), 0,
+                 wx.ALL | wx.ALIGN_RIGHT, 10)
+        dialog.SetSizerAndFit(root)
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return None
+            return available[camera_choice.GetSelection()]
+        finally:
+            dialog.Destroy()
 
     def open_camera_capture_device(self, camera_index):
         """Open and retain a camera so bridge devices remain initialised."""
@@ -7909,16 +7965,71 @@ class ScanBox(wx.Frame):
         camera_panel = wx.Panel(notebook)
         _set_named_page_accessible(camera_panel, "Camera")
         camera_sizer = wx.BoxSizer(wx.VERTICAL)
-        camera_help = wx.StaticText(
-            camera_panel,
-            label=(
-                "These settings apply whenever OCR using Camera or a photo "
-                "camera command is started. Set number of captures to zero "
-                "for continuous capture."
-            ),
+        saved_camera_index = self.app_settings.get("camera_index", -1)
+        saved_camera_name = self.app_settings.get("camera_name", "Selected camera")
+        camera_options = (
+            [{"index": saved_camera_index, "name": saved_camera_name}]
+            if saved_camera_index != -1 else []
         )
-        camera_help.Wrap(480)
-        camera_sizer.Add(camera_help, 0, wx.ALL | wx.EXPAND, 10)
+        camera_choice = wx.Choice(
+            camera_panel,
+            choices=["Ask me each time"] + [item["name"] for item in camera_options],
+        )
+        camera_choice.SetName("Choose default camera")
+        camera_choice.SetSelection(1 if camera_options else 0)
+        camera_status = wx.StaticText(camera_panel, label="Looking for cameras…")
+        camera_status.SetName("Camera discovery status")
+        refresh_cameras_btn = wx.Button(camera_panel, label="Find Cameras")
+        camera_sizer.Add(wx.StaticText(camera_panel, label="Choose default camera"),
+                         0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        camera_sizer.Add(camera_choice, 0, wx.ALL | wx.EXPAND, 10)
+        camera_sizer.Add(camera_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        camera_sizer.Add(refresh_cameras_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        def finish_camera_discovery(cameras):
+            nonlocal camera_options
+            try:
+                previous_index = (
+                    camera_options[camera_choice.GetSelection() - 1]["index"]
+                    if camera_choice.GetSelection() > 0 else -1
+                )
+                saved_missing = saved_camera_index != -1 and not any(
+                    item["index"] == saved_camera_index for item in cameras
+                )
+                camera_options = ([{"index": saved_camera_index, "name": saved_camera_name}]
+                                  if saved_missing else []) + cameras
+                camera_choice.Clear()
+                camera_choice.Append("Ask me each time")
+                for position, item in enumerate(camera_options):
+                    label = item["name"]
+                    if saved_missing and position == 0:
+                        label += " (not currently detected)"
+                    camera_choice.Append(label)
+                selected = next((position + 1 for position, item in enumerate(camera_options)
+                                 if item["index"] == previous_index), 0)
+                camera_choice.SetSelection(selected)
+                camera_status.SetLabel(
+                    f"Found {len(cameras)} camera" + ("." if len(cameras) == 1 else "s.")
+                    if cameras else "No cameras were found."
+                )
+                refresh_cameras_btn.Enable(True)
+                camera_panel.Layout()
+            except RuntimeError:
+                pass
+
+        def find_cameras(event=None):
+            refresh_cameras_btn.Enable(False)
+            camera_status.SetLabel("Looking for cameras…")
+            def worker():
+                indexes = self.available_camera_indexes()
+                names = self.camera_device_names()
+                cameras = [{"index": index, "name": names.get(index, f"Camera {index + 1}")}
+                           for index in indexes]
+                wx.CallAfter(finish_camera_discovery, cameras)
+            threading.Thread(target=worker, name="ScanBox camera discovery", daemon=True).start()
+
+        refresh_cameras_btn.Bind(wx.EVT_BUTTON, find_cameras)
+        find_cameras()
 
         camera_delay_label = wx.StaticText(
             camera_panel, label="Delay before first capture, in seconds"
@@ -8021,7 +8132,7 @@ class ScanBox(wx.Frame):
         ai_sizer.Add(model_choice, 0, wx.ALL | wx.EXPAND, 10)
 
         find_local_ai_btn = wx.Button(ai_panel, label="Find Local AI")
-        found_ai_choice = wx.Choice(ai_panel, choices=[])
+        found_ai_choice = wx.ListBox(ai_panel, choices=[], style=wx.LB_SINGLE)
         found_ai_choice.SetName("Detected local AI models")
         external_results = []
         saved_external = external_ai_config(self.app_settings)
@@ -8040,22 +8151,41 @@ class ScanBox(wx.Frame):
             label=("Saved local AI connection." if saved_external else ""),
         )
         external_status.SetName("Local AI discovery status")
-        external_url_label = wx.StaticText(ai_panel, label="Server address (advanced)")
+        saved_ai_url = self.app_settings.get("external_ai_url", "")
+        saved_ai_parts = urlsplit(saved_ai_url if "://" in saved_ai_url else "http://" + saved_ai_url)
+        external_url_label = wx.StaticText(ai_panel, label="Server address or IP")
         external_url = wx.TextCtrl(
             ai_panel,
-            value=self.app_settings.get("external_ai_url", ""),
+            value=(saved_ai_parts.hostname or "127.0.0.1"),
         )
         external_url.SetName("Local AI server address")
-        external_model_label = wx.StaticText(ai_panel, label="Model name (advanced)")
+        external_port_label = wx.StaticText(ai_panel, label="Port")
+        external_port = wx.SpinCtrl(ai_panel, min=1, max=65535)
+        external_port.SetName("Local AI server port")
+        external_port.SetValue(saved_ai_parts.port or 11434)
+        external_api_key_label = wx.StaticText(ai_panel, label="API key (optional)")
+        external_api_key = wx.TextCtrl(
+            ai_panel, value=self.app_settings.get("external_ai_api_key", ""),
+            style=wx.TE_PASSWORD,
+        )
+        external_api_key.SetName("Local AI API key")
+        external_kind = wx.RadioBox(
+            ai_panel,
+            label="API type",
+            choices=["OpenAI compatible", "Ollama"],
+            majorDimension=1,
+            style=wx.RA_SPECIFY_ROWS,
+        )
+        external_kind.SetName("Local AI API type")
+        external_kind.SetSelection(
+            1 if self.app_settings.get("external_ai_kind") == "ollama" else 0
+        )
+        external_model_label = wx.StaticText(ai_panel, label="Model name")
         external_model = wx.TextCtrl(
             ai_panel,
             value=self.app_settings.get("external_ai_model", ""),
         )
         external_model.SetName("Local AI model name")
-        external_url_label.Hide()
-        external_url.Hide()
-        external_model_label.Hide()
-        external_model.Hide()
         ai_sizer.Add(find_local_ai_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         ai_sizer.Add(
             wx.StaticText(ai_panel, label="Detected local AI models"),
@@ -8065,6 +8195,11 @@ class ScanBox(wx.Frame):
         ai_sizer.Add(external_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
         ai_sizer.Add(external_url_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
         ai_sizer.Add(external_url, 0, wx.ALL | wx.EXPAND, 10)
+        ai_sizer.Add(external_port_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        ai_sizer.Add(external_port, 0, wx.ALL | wx.EXPAND, 10)
+        ai_sizer.Add(external_api_key_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        ai_sizer.Add(external_api_key, 0, wx.ALL | wx.EXPAND, 10)
+        ai_sizer.Add(external_kind, 0, wx.ALL | wx.EXPAND, 10)
         ai_sizer.Add(external_model_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
         ai_sizer.Add(external_model, 0, wx.ALL | wx.EXPAND, 10)
 
@@ -8112,6 +8247,9 @@ class ScanBox(wx.Frame):
             find_local_ai_btn.Enable(not builtin_selected)
             found_ai_choice.Enable(not builtin_selected)
             external_url.Enable(not builtin_selected)
+            external_port.Enable(not builtin_selected)
+            external_api_key.Enable(not builtin_selected)
+            external_kind.Enable(not builtin_selected)
             external_model.Enable(not builtin_selected)
             ai_panel.Layout()
 
@@ -8122,7 +8260,10 @@ class ScanBox(wx.Frame):
             selected = found_ai_choice.GetSelection()
             if 0 <= selected < len(external_results):
                 item = external_results[selected]
-                external_url.SetValue(item["url"])
+                parts = urlsplit(item["url"])
+                external_url.SetValue(parts.hostname or item["url"])
+                external_port.SetValue(parts.port or (443 if parts.scheme == "https" else 80))
+                external_kind.SetSelection(1 if item["kind"] == "ollama" else 0)
                 external_model.SetValue(item["model"])
                 external_status.SetLabel(f"Selected {item['label']}.")
                 ai_panel.Layout()
@@ -8132,7 +8273,19 @@ class ScanBox(wx.Frame):
             external_status.SetLabel("Looking for local AI services…")
             ai_panel.Layout()
             wx.SafeYield(ai_panel, onlyIfNeeded=True)
-            results = discover_local_ai_models()
+            custom_url = _local_ai_url_with_port(
+                external_url.GetValue(), external_port.GetValue()
+            )
+            results = (discover_local_ai_models_at(
+                custom_url, external_api_key.GetValue()
+            ) if custom_url else [])
+            identities = {(item["kind"], item["url"], item["model"])
+                          for item in results}
+            results.extend(
+                item for item in discover_local_ai_models()
+                if (item["kind"], item["url"], item["model"])
+                not in identities
+            )
             external_results = results
             found_ai_choice.Clear()
             for item in results:
@@ -8162,15 +8315,11 @@ class ScanBox(wx.Frame):
                     "No local AI service was found. Start it and try again, "
                     "or enter its server address and model name."
                 )
-                external_url_label.Show()
-                external_url.Show()
-                external_model_label.Show()
-                external_model.Show()
             ai_panel.Layout()
 
         ai_source.Bind(wx.EVT_RADIOBOX, lambda event: refresh_model_controls())
         find_local_ai_btn.Bind(wx.EVT_BUTTON, find_local_ai)
-        found_ai_choice.Bind(wx.EVT_CHOICE, select_external_result)
+        found_ai_choice.Bind(wx.EVT_LISTBOX, select_external_result)
 
         def on_install_model(event):
             selected_index = model_choice.GetSelection()
@@ -8273,6 +8422,17 @@ class ScanBox(wx.Frame):
                 self.app_settings["camera_capture_count"] = (
                     camera_count.GetValue()
                 )
+                camera_selection = camera_choice.GetSelection()
+                selected_camera = (
+                    camera_options[camera_selection - 1]
+                    if 0 < camera_selection <= len(camera_options) else None
+                )
+                self.app_settings["camera_index"] = (
+                    selected_camera["index"] if selected_camera else -1
+                )
+                self.app_settings["camera_name"] = (
+                    selected_camera["name"] if selected_camera else "Ask me each time"
+                )
                 scanner_selection = scanner_choice.GetSelection()
                 selected_scanner = (
                     scanner_options[scanner_selection - 1]
@@ -8304,17 +8464,20 @@ class ScanBox(wx.Frame):
                     )
                     self.app_settings["external_ai_kind"] = (
                         selected_item["kind"]
-                        if selected_item
-                        else _local_ai_kind_for_url(external_url.GetValue())
+                        if selected_item else ("ollama" if external_kind.GetSelection() == 1
+                                               else "openai")
                     )
                     self.app_settings["external_ai_label"] = (
                         selected_item["name"] if selected_item else "Local AI"
                     )
-                    self.app_settings["external_ai_url"] = _normalise_local_ai_url(
-                        external_url.GetValue()
+                    self.app_settings["external_ai_url"] = _local_ai_url_with_port(
+                        external_url.GetValue(), external_port.GetValue()
                     )
                     self.app_settings["external_ai_model"] = (
                         external_model.GetValue().strip()
+                    )
+                    self.app_settings["external_ai_api_key"] = (
+                        external_api_key.GetValue().strip()
                     )
                     if external_ai_config(self.app_settings) is None:
                         self.app_settings["ai_provider"] = "builtin"
