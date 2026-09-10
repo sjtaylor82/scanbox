@@ -1,6 +1,7 @@
 import ctypes
 from ctypes import wintypes
 import base64
+import io
 from collections import Counter
 import asyncio
 import json
@@ -53,10 +54,14 @@ from fpdf import FPDF
 from PIL import Image, ImageGrab, ImageOps, UnidentifiedImageError
 
 APP_NAME = "ScanBox"
-APP_VERSION = "2026.9.1"
+APP_VERSION = "2026.9.2"
 UPDATE_MANIFEST_URL = os.environ.get(
     "SCANBOX_UPDATE_MANIFEST_URL",
     "https://api.github.com/repos/sjtaylor82/scanbox/releases/latest",
+).strip()
+MTMD_RUNTIME_RELEASE_URL = os.environ.get(
+    "SCANBOX_MTMD_RUNTIME_RELEASE_URL",
+    "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/b10216",
 ).strip()
 
 
@@ -340,9 +345,58 @@ DEFAULT_APP_SETTINGS = {
     "camera_interval_seconds": 5,
     # Zero means repeat until the user chooses Stop Camera Capture.
     "camera_capture_count": 1,
+    "scanner_id": "",
+    "scanner_name": "Ask me each time",
     "vision_model": DEFAULT_VISION_MODEL_ID,
+    "ai_provider": "builtin",
+    "external_ai_kind": "",
+    "external_ai_url": "",
+    "external_ai_model": "",
+    "external_ai_label": "",
     "mac_permissions_prompted": False,
 }
+
+CAMERA_SETTLE_SECONDS = 1.5
+CAMERA_FRAME_TIMEOUT_SECONDS = 6.0
+CAMERA_READ_INTERVAL_SECONDS = 0.05
+
+
+def _camera_frame_is_usable(frame):
+    """Reject missing and uniform placeholder frames from camera bridges."""
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return False
+    if np is None:
+        return True
+    try:
+        # DirectShow bridge cameras can initially return an all-black,
+        # all-white, or otherwise uniform placeholder.
+        return float(np.max(frame)) - float(np.min(frame)) >= 2.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _read_settled_camera_frame(
+    camera,
+    settle_seconds=CAMERA_SETTLE_SECONDS,
+    timeout_seconds=CAMERA_FRAME_TIMEOUT_SECONDS,
+    read_interval=CAMERA_READ_INTERVAL_SECONDS,
+):
+    """Read over elapsed time so slower DirectShow bridges can deliver a frame."""
+    started = time.monotonic()
+    deadline = started + max(float(timeout_seconds), 0.0)
+    latest = None
+    attempts = 0
+    while True:
+        attempts += 1
+        ok, candidate = camera.read()
+        if ok and _camera_frame_is_usable(candidate):
+            latest = candidate
+        now = time.monotonic()
+        if latest is not None and now - started >= max(float(settle_seconds), 0.0):
+            return latest, attempts
+        if now >= deadline:
+            return latest, attempts
+        time.sleep(max(float(read_interval), 0.0))
 
 # Leave processor capacity for the desktop and screen reader while giving the
 # larger multimodal model enough parallelism to avoid looking as though the
@@ -410,8 +464,10 @@ def configure_logging(enabled):
 
 try:
     import win32com.client
+    import pythoncom
 except ImportError:
     win32com = None
+    pythoncom = None
 
 try:
     # PyObjC, used only for a single, non-interactive call at startup:
@@ -704,6 +760,225 @@ def write_app_settings(settings):
     }
     with open(APP_SETTINGS_CONFIG, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+LOCAL_AI_SERVICES = (
+    {
+        "kind": "ollama",
+        "name": "Ollama",
+        "models_url": "http://127.0.0.1:11434/api/tags",
+        "base_url": "http://127.0.0.1:11434",
+    },
+    {
+        "kind": "openai",
+        "name": "LM Studio",
+        "models_url": "http://127.0.0.1:1234/v1/models",
+        "base_url": "http://127.0.0.1:1234/v1",
+    },
+    {
+        "kind": "openai",
+        "name": "vLLM",
+        "models_url": "http://127.0.0.1:8000/v1/models",
+        "base_url": "http://127.0.0.1:8000/v1",
+    },
+)
+
+
+def _normalise_local_ai_url(url):
+    """Validate a loopback-only AI service URL and remove trailing slashes."""
+    value = str(url or "").strip().rstrip("/")
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+        "127.0.0.1", "localhost", "::1",
+    }:
+        return ""
+    return value
+
+
+def _local_ai_kind_for_url(url):
+    try:
+        return "ollama" if urlsplit(str(url).strip()).port == 11434 else "openai"
+    except ValueError:
+        return "openai"
+
+
+def external_ai_config(settings=None):
+    settings = settings or read_app_settings()
+    if settings.get("ai_provider") != "external":
+        return None
+    url = _normalise_local_ai_url(settings.get("external_ai_url", ""))
+    model = settings.get("external_ai_model", "").strip()
+    if not url or not model:
+        return None
+    kind = settings.get("external_ai_kind", "openai") or "openai"
+    if kind == "openai" and urlsplit(url).path in {"", "/"}:
+        url += "/v1"
+    return {
+        "kind": kind,
+        "name": settings.get("external_ai_label", "Local AI") or "Local AI",
+        "url": url,
+        "model": model,
+    }
+
+
+def _probe_local_ai_service(service, timeout=1.5):
+    """Return every model advertised by one known local AI service."""
+    try:
+        request = urllib.request.Request(
+            service["models_url"],
+            headers={"User-Agent": f"ScanBox/{APP_VERSION}"},
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+        if service["kind"] == "ollama":
+            model_ids = [
+                str(item.get("model") or item.get("name") or "").strip()
+                for item in payload.get("models", [])
+                if isinstance(item, dict)
+            ]
+        else:
+            model_ids = [
+                str(item.get("id") or "").strip()
+                for item in payload.get("data", [])
+                if isinstance(item, dict)
+            ]
+        return [
+            {
+                "kind": service["kind"],
+                "name": service["name"],
+                "url": service["base_url"],
+                "model": model_id,
+                "label": f"{service['name']}: {model_id}",
+            }
+            for model_id in model_ids
+            if model_id
+        ]
+    except Exception:
+        logger.debug(
+            "Local AI service was not available: %s",
+            service["name"],
+            exc_info=True,
+        )
+        return []
+
+
+def discover_local_ai_models(timeout=1.5):
+    """Discover all models from common local services, preserving service order."""
+    with ThreadPoolExecutor(max_workers=len(LOCAL_AI_SERVICES)) as executor:
+        groups = list(
+            executor.map(
+                lambda service: _probe_local_ai_service(service, timeout),
+                LOCAL_AI_SERVICES,
+            )
+        )
+    found = []
+    seen = set()
+    for group in groups:
+        for item in group:
+            identity = (item["kind"], item["url"], item["model"])
+            if identity not in seen:
+                seen.add(identity)
+                found.append(item)
+    return found
+
+
+def _external_ai_prompt(task, prompt_override=None):
+    if prompt_override:
+        return prompt_override
+    if task == "transcribe":
+        return (
+            "Transcribe all visible text accurately in reading order. Preserve "
+            "headings, lists, and tables using clear plain text or Markdown. Do "
+            "not add information that is not visible in the document."
+        )
+    return (
+        "Describe this image accurately and in useful detail for a blind person. "
+        "Describe the overall scene, main subjects, actions, important objects, "
+        "visible text, and background. Do not invent details."
+    )
+
+
+def run_external_ai_task(
+    task, image_path, prompt_override=None, max_tokens=None,
+    cancel_event=None, settings=None,
+):
+    """Send an acquired image to the selected loopback-only AI service."""
+    config = external_ai_config(settings)
+    if not config:
+        return "Local AI service is not configured."
+    if cancel_event is not None and cancel_event.is_set():
+        return PHOTO_DESCRIPTION_CANCELLED
+    try:
+        if max_tokens is None:
+            max_tokens = 8192 if task == "transcribe" else 512
+        # Scanner TIFFs and imported images must use a format the services
+        # support. Encode the actual pixels, without modifying the source.
+        with Image.open(image_path) as source, io.BytesIO() as image_file:
+            ImageOps.exif_transpose(source).convert("RGB").save(image_file, "PNG")
+            encoded = base64.b64encode(image_file.getvalue()).decode("ascii")
+        prompt = _external_ai_prompt(task, prompt_override)
+        if config["kind"] == "ollama":
+            endpoint = config["url"] + "/api/chat"
+            payload = {
+                "model": config["model"],
+                "messages": [{
+                    "role": "user",
+                    "content": prompt,
+                    "images": [encoded],
+                }],
+                "stream": False,
+                "options": {"temperature": 0, "num_predict": max_tokens},
+            }
+        else:
+            endpoint = config["url"] + "/chat/completions"
+            mime = "image/png"
+            payload = {
+                "model": config["model"],
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{encoded}"},
+                        },
+                    ],
+                }],
+                "max_tokens": max_tokens,
+                "temperature": 0,
+            }
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"ScanBox/{APP_VERSION}",
+            },
+        )
+        with urllib.request.urlopen(
+            request, timeout=MTMD_TIMEOUT_SECONDS
+        ) as response:
+            result = json.load(response)
+        if cancel_event is not None and cancel_event.is_set():
+            return PHOTO_DESCRIPTION_CANCELLED
+        if config["kind"] == "ollama":
+            if result.get("done_reason") == "length" or result.get("done") is False:
+                return "Local AI service returned incomplete text; the result was not used."
+            text = str(result.get("message", {}).get("content", "")).strip()
+        else:
+            if result.get("choices", [{}])[0].get("finish_reason") == "length":
+                return "Local AI service returned incomplete text; the result was not used."
+            text = str(
+                result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            ).strip()
+        return text or "Local AI service returned no text."
+    except Exception as exc:
+        logger.exception(
+            "External local AI task failed service=%s model=%s",
+            config["name"],
+            config["model"],
+        )
+        return f"Local AI service could not run: {exc}"
 
 
 def load_photo_library(path=PHOTO_LIBRARY_MANIFEST):
@@ -1320,6 +1595,8 @@ def run_florence_task(task, image_path, cancel_event=None):
 
 
 def vision_ready(task="describe"):
+    if external_ai_config() is not None:
+        return True
     if task != "describe":
         return florence_ready()
     model_id = read_app_settings().get("vision_model", DEFAULT_VISION_MODEL_ID)
@@ -1332,6 +1609,17 @@ def vision_ready(task="describe"):
 def _find_mtmd_runner():
     runners = _find_mtmd_runners()
     return runners[0] if runners else None
+
+
+def _mtmd_runtime_needs_repair(platform_name=None):
+    """Return whether an installed Qwen pack lacks its preferred runtime."""
+    platform_name = platform_name or sys.platform
+    runners = _find_mtmd_runners()
+    if platform_name == "win32":
+        # Older ScanBox versions could leave a working CPU runner behind.
+        # Repair that installation too so Windows can use Vulkan-capable GPUs.
+        return not any("vulkan" in path.lower() for path in runners)
+    return platform_name == "darwin" and not runners
 
 
 def _find_mtmd_runners():
@@ -1432,6 +1720,12 @@ def _preferred_mtmd_device(runner):
 
 def local_ai_acceleration_report(model_id):
     """Name the selected model and processor used for real inference."""
+    external = external_ai_config()
+    if external:
+        return (
+            f"Active model: {external['model']} via {external['name']}\n"
+            "Graphics processor used: managed by the selected local AI service."
+        )
     model = VISION_MODELS.get(model_id, VISION_MODELS[DEFAULT_VISION_MODEL_ID])
     if model["runner"] == "florence":
         return (
@@ -1830,7 +2124,7 @@ def _install_mtmd_runtime(status_callback=None, cancel_event=None):
         status_callback("Downloading the local image model runner...")
     try:
         request = urllib.request.Request(
-            "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest",
+            MTMD_RUNTIME_RELEASE_URL,
             headers={"User-Agent": f"ScanBox/{APP_VERSION}"},
         )
         with urllib.request.urlopen(request, timeout=30) as response:
@@ -1858,9 +2152,10 @@ def _install_mtmd_runtime(status_callback=None, cancel_event=None):
                 None,
             )
             if not asset or not asset.get("browser_download_url"):
-                if runtime_kind == "cpu" and not _find_mtmd_runner():
-                    return "The local image-model runner could not be found in the latest release."
-                continue
+                return (
+                    f"The {runtime_kind} local image-model runner could not be "
+                    "found in ScanBox's tested runtime release."
+                )
             if status_callback:
                 status_callback(f"Downloading the {runtime_kind} image-model runner...")
             archive = os.path.join(TEMP_DIR, asset["name"])
@@ -1890,7 +2185,15 @@ def _install_mtmd_runtime(status_callback=None, cancel_event=None):
                             raise ValueError("The runner archive contains an unsafe path.")
                     bundle.extractall(runtime_target)
             os.remove(archive)
-        if not _find_mtmd_runner():
+        installed_runners = _find_mtmd_runners()
+        if sys.platform == "win32" and not any(
+            "vulkan" in path.lower() for path in installed_runners
+        ):
+            return (
+                "The Vulkan image-model runner downloaded but its program "
+                "was not found."
+            )
+        if not installed_runners:
             return "The image-model runner downloaded but its program was not found."
         return None
     except DownloadCancelled:
@@ -2242,11 +2545,40 @@ def install_local_ai_pack(status_callback=None, model_id=DEFAULT_VISION_MODEL_ID
     return "The selected local AI model downloaded but could not be loaded."
 
 
-def run_vision_task(task, image_path, cancel_event=None):
+def run_vision_task(
+    task, image_path, cancel_event=None, prompt_override=None, max_tokens=None,
+):
     """Run the local model selected in Settings."""
+    settings = read_app_settings()
+    external = external_ai_config(settings)
+    if external:
+        started = time.perf_counter()
+        text = run_external_ai_task(
+            task,
+            image_path,
+            prompt_override,
+            max_tokens if max_tokens is not None else (384 if task == "question" else None),
+            cancel_event,
+            settings,
+        )
+        elapsed = time.perf_counter() - started
+        logger.info(
+            "%s model=%s %s completed in %.1f seconds",
+            external["name"], external["model"], task, elapsed,
+        )
+        if (
+            task in {"describe", "question"}
+            and text != PHOTO_DESCRIPTION_CANCELLED
+            and not text.startswith("Local AI service")
+        ):
+            text += (
+                f"\n\nModel: {external['model']} via {external['name']}. "
+                f"Processing time: {elapsed:.1f} seconds."
+            )
+        return text
     if task != "describe":
         return run_florence_task(task, image_path)
-    model_id = read_app_settings().get("vision_model", DEFAULT_VISION_MODEL_ID)
+    model_id = settings.get("vision_model", DEFAULT_VISION_MODEL_ID)
     model = VISION_MODELS.get(model_id, VISION_MODELS[DEFAULT_VISION_MODEL_ID])
     started = time.perf_counter()
     if model["runner"] == "florence":
@@ -3068,6 +3400,7 @@ class ScanBox(wx.Frame):
         self.camera_capture_target = 1
         self.camera_capture_interval = 5
         self.camera_capture_index = None
+        self.camera_capture_device = None
         self.camera_capture_photo_mode = False
         self.camera_alignment_active = False
         self.camera_alignment_stop_event = None
@@ -3486,7 +3819,21 @@ class ScanBox(wx.Frame):
 
     def _preload_local_ai(self):
         try:
+            if external_ai_config(self.app_settings) is not None:
+                logger.info("Built-in AI preload skipped while another local AI is selected.")
+                return
             model_id = self.app_settings.get("vision_model", DEFAULT_VISION_MODEL_ID)
+            if (
+                model_id == "qwen3_vl_2b"
+                and _find_mtmd_model_files(model_id) is not None
+                and _mtmd_runtime_needs_repair()
+            ):
+                logger.info(
+                    "Installed Qwen model is missing its preferred runtime; "
+                    "starting automatic repair."
+                )
+                wx.CallAfter(self.start_install, model_id)
+                return
             if model_id == "qwen3_vl_2b" and vision_ready():
                 total_memory = _total_physical_memory()
                 if total_memory >= QWEN_PRELOAD_MINIMUM_RAM:
@@ -4028,6 +4375,7 @@ class ScanBox(wx.Frame):
 
     def _ask_screen_question(self, path, restore_window=None, restore_app=""):
         model_id = self.app_settings.get("vision_model", DEFAULT_VISION_MODEL_ID)
+        external_available = external_ai_config(self.app_settings) is not None
         qwen_installed = (
             _find_mtmd_model_files("qwen3_vl_2b") is not None
             and _find_mtmd_runner() is not None
@@ -4037,7 +4385,7 @@ class ScanBox(wx.Frame):
             model_id,
             qwen_installed,
         )
-        if model_id != "qwen3_vl_2b" and qwen_installed:
+        if not external_available and model_id != "qwen3_vl_2b" and qwen_installed:
             if wx.MessageBox(
                 "Qwen3-VL 2B is required to answer questions. Switch to Qwen now?",
                 "Ask ScanBox a question",
@@ -4056,7 +4404,7 @@ class ScanBox(wx.Frame):
                 daemon=True,
             ).start()
             logger.info("Ask ScanBox switched the selected model to Qwen3-VL 2B")
-        elif not qwen_installed:
+        elif not external_available and not qwen_installed:
             _remove_quietly(path)
             install = wx.MessageBox(
                 "Qwen3-VL 2B is required to answer questions and is not installed. "
@@ -4567,6 +4915,22 @@ class ScanBox(wx.Frame):
         wx.CallAfter(self._finish_screen_description, path, text)
 
     def _read_screen_text(self, path, use_vision_fallback=False, cancel_event=None):
+        if cancel_event is not None and cancel_event.is_set():
+            return PHOTO_DESCRIPTION_CANCELLED
+        external_attempted = (
+            use_vision_fallback
+            and external_ai_config(self.app_settings) is not None
+        )
+        if external_attempted:
+            text = run_external_ai_task(
+                "transcribe", path, cancel_event=cancel_event,
+                settings=self.app_settings,
+            )
+            if text == PHOTO_DESCRIPTION_CANCELLED:
+                return text
+            if not text.startswith("Local AI service") and not looks_like_ocr_repetition_garbage(text):
+                return clean_screen_ocr_text(text)
+            logger.warning("External screen OCR failed; falling back to native OCR: %s", text)
         if sys.platform == "darwin":
             text = clean_screen_ocr_text(macos_ocr(path))
             native_ocr_name = "Apple Vision"
@@ -4576,7 +4940,7 @@ class ScanBox(wx.Frame):
         if len(re.findall(r"[A-Za-z0-9]+", text)) >= 5:
             logger.info("Screen OCR used %s", native_ocr_name)
             return text
-        if use_vision_fallback and vision_ready("transcribe"):
+        if use_vision_fallback and not external_attempted and vision_ready("transcribe"):
             logger.info("Screen OCR used Florence-2 fallback")
             return clean_screen_ocr_text(
                 run_vision_task("transcribe", path, cancel_event)
@@ -4607,13 +4971,21 @@ class ScanBox(wx.Frame):
                 "details.\n\nQuestion: " + question
             )
             started = time.perf_counter()
-            text = run_mtmd_task(
-                "question", path, model_id, prompt, 384, self.shutdown_event
-            )
+            if external_ai_config(self.app_settings) is not None:
+                text = run_external_ai_task(
+                    "question", path, prompt, 384, self.shutdown_event,
+                    self.app_settings,
+                )
+                model_label = self.app_settings.get("external_ai_model", "Local AI")
+            else:
+                text = run_mtmd_task(
+                    "question", path, model_id, prompt, 384, self.shutdown_event
+                )
+                model_label = VISION_MODELS[model_id]["name"]
             elapsed = time.perf_counter() - started
-            if not text.startswith("Local vision"):
+            if not text.startswith(("Local vision", "Local AI service")):
                 text += (
-                    f"\n\nModel: {VISION_MODELS[model_id]['name']}. "
+                    f"\n\nModel: {model_label}. "
                     f"Processing time: {elapsed:.1f} seconds."
                 )
         except Exception as exc:
@@ -4691,13 +5063,24 @@ class ScanBox(wx.Frame):
         )
         started = time.perf_counter()
         try:
-            answer = run_mtmd_task(
-                "question", path, "qwen3_vl_2b", prompt, 384, cancel_event
-            )
+            if external_ai_config(self.app_settings) is not None:
+                answer = run_external_ai_task(
+                    "question", path, prompt, 384, cancel_event,
+                    self.app_settings,
+                )
+                model_label = self.app_settings.get("external_ai_model", "Local AI")
+            else:
+                answer = run_mtmd_task(
+                    "question", path, "qwen3_vl_2b", prompt, 384, cancel_event
+                )
+                model_label = "Qwen3-VL 2B"
             elapsed = time.perf_counter() - started
-            if answer != PHOTO_DESCRIPTION_CANCELLED and not answer.startswith("Local vision"):
+            if (
+                answer != PHOTO_DESCRIPTION_CANCELLED
+                and not answer.startswith(("Local vision", "Local AI service"))
+            ):
                 answer += (
-                    "\n\nModel: Qwen3-VL 2B. "
+                    f"\n\nModel: {model_label}. "
                     f"Processing time: {elapsed:.1f} seconds."
                 )
         except Exception as exc:
@@ -4706,7 +5089,10 @@ class ScanBox(wx.Frame):
         finally:
             # Asking a question must not turn Qwen into the persistent model
             # when Florence remains the user's everyday selection.
-            if self.app_settings.get("vision_model") != "qwen3_vl_2b":
+            if (
+                external_ai_config(self.app_settings) is None
+                and self.app_settings.get("vision_model") != "qwen3_vl_2b"
+            ):
                 stop_mtmd_server()
         wx.CallAfter(
             self._finish_photo_question,
@@ -4802,8 +5188,11 @@ class ScanBox(wx.Frame):
             )
         )
         qwen_questions_available = bool(
-            _find_mtmd_model_files("qwen3_vl_2b") is not None
-            and _find_mtmd_runner() is not None
+            external_ai_config(self.app_settings) is not None
+            or (
+                _find_mtmd_model_files("qwen3_vl_2b") is not None
+                and _find_mtmd_runner() is not None
+            )
         )
         has_current_photo = any(
             mode == "photo" and os.path.isfile(path)
@@ -5119,6 +5508,98 @@ class ScanBox(wx.Frame):
             self.Raise()
         self.update_controls()
 
+    @staticmethod
+    def _wia_scanner_name(device_info):
+        try:
+            return str(device_info.Properties("Name").Value).strip()
+        except Exception:
+            try:
+                for index in range(1, device_info.Properties.Count + 1):
+                    prop = device_info.Properties[index]
+                    if str(getattr(prop, "Name", "")).lower() == "name":
+                        return str(prop.Value).strip()
+            except Exception:
+                pass
+        return "Unnamed scanner"
+
+    def available_scanners(self):
+        """Return stable identifiers and names for all detected scanners."""
+        if sys.platform == "win32":
+            if win32com is None:
+                return []
+            com_initialized = False
+            try:
+                if (
+                    pythoncom is not None
+                    and threading.current_thread() is not threading.main_thread()
+                ):
+                    pythoncom.CoInitialize()
+                    com_initialized = True
+                manager = win32com.client.Dispatch("WIA.DeviceManager")
+                scanners = []
+                seen = set()
+                for index in range(1, manager.DeviceInfos.Count + 1):
+                    info = manager.DeviceInfos[index]
+                    identifier = str(info.DeviceID)
+                    if info.Type == 1 and identifier not in seen:
+                        seen.add(identifier)
+                        scanners.append({
+                            "id": identifier,
+                            "name": self._wia_scanner_name(info),
+                        })
+                return scanners
+            except Exception:
+                logger.exception("Could not enumerate WIA scanners")
+                return []
+            finally:
+                if com_initialized:
+                    pythoncom.CoUninitialize()
+        if sys.platform == "darwin" and os.path.isfile(MACOS_CAPTURE_HELPER):
+            try:
+                listed = subprocess.run(
+                    [MACOS_CAPTURE_HELPER, "list-scanners"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=40,
+                )
+                scanners = []
+                for line in listed.stdout.splitlines():
+                    kind, separator, value = line.partition("\t")
+                    identifier, separator2, name = value.partition("\t")
+                    if kind == "scanner" and separator and separator2 and identifier:
+                        scanners.append({
+                            "id": identifier,
+                            "name": name or "Unnamed scanner",
+                        })
+                return scanners
+            except (OSError, subprocess.SubprocessError):
+                logger.exception("Could not enumerate macOS scanners")
+        return []
+
+    def selected_scanner(self, scanners):
+        """Resolve the saved scanner, prompting only for Ask me each time."""
+        saved_id = self.app_settings.get("scanner_id", "")
+        if saved_id:
+            return next(
+                (scanner for scanner in scanners if scanner["id"] == saved_id),
+                None,
+            )
+        dialog = wx.SingleChoiceDialog(
+            self,
+            "Choose the scanner to use.",
+            "Select scanner",
+            [scanner["name"] for scanner in scanners],
+        )
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return None
+            return scanners[dialog.GetSelection()]
+        finally:
+            dialog.Destroy()
+
     def scan_page(self):
         if sys.platform == "darwin":
             return self.scan_macos_scanner()
@@ -5130,35 +5611,40 @@ class ScanBox(wx.Frame):
             )
             return None
 
-        # WIA enumeration covers scanners and a small number of legacy WIA
-        # cameras, but most modern USB/UVC cameras use a separate Windows
-        # camera interface. Do not tell a camera-only user to disconnect an
-        # unrelated USB device: camera capture has its own explicit button.
-        try:
-            device_manager = win32com.client.Dispatch("WIA.DeviceManager")
-            scanner_count = sum(
-                1
-                for index in range(1, device_manager.DeviceInfos.Count + 1)
-                if device_manager.DeviceInfos[index].Type == 1
+        scanners = self.available_scanners()
+        if not scanners:
+            wx.MessageBox(
+                "No Windows scanner was found. To use a USB document camera "
+                "instead, choose OCR using Camera on the Scan tab.",
+                "Scanner not found",
             )
-            if scanner_count == 0:
+            return None
+        scanner = self.selected_scanner(scanners)
+        if scanner is None:
+            if self.app_settings.get("scanner_id", ""):
                 wx.MessageBox(
-                    "No Windows scanner was found. To use a USB document "
-                    "camera instead, choose OCR using Camera "
-                    "on the Scan tab.",
+                    "The scanner selected in Settings is not available. Connect "
+                    "it or choose another scanner in Settings.",
                     "Scanner not found",
                 )
-                return None
-        except Exception:
-            logger.exception("Could not enumerate WIA devices")
+            return None
 
         cd = win32com.client.Dispatch("WIA.CommonDialog")
         # WIA device type 1 is a scanner. USB/UVC cameras are deliberately
         # handled by capture_camera_page so the two capture sources cannot
         # mask or take precedence over one another.
-        dev = cd.ShowSelectDevice(1, False, False)
-        if not dev:
+        device_manager = win32com.client.Dispatch("WIA.DeviceManager")
+        info = next(
+            (
+                device_manager.DeviceInfos[index]
+                for index in range(1, device_manager.DeviceInfos.Count + 1)
+                if str(device_manager.DeviceInfos[index].DeviceID) == scanner["id"]
+            ),
+            None,
+        )
+        if info is None:
             return None
+        dev = info.Connect()
 
         item = dev.Items[1]
         tiff_format = "{B96B3CB1-0728-11D3-9D7B-0000F81EF32E}"
@@ -5170,7 +5656,7 @@ class ScanBox(wx.Frame):
         return path
 
     def scan_macos_scanner(self):
-        """Select and scan from an ImageCaptureCore scanner on macOS."""
+        """Scan from the configured ImageCaptureCore scanner on macOS."""
         if not os.path.isfile(MACOS_CAPTURE_HELPER):
             wx.MessageBox(
                 "The native macOS scanner component is missing. Reinstall "
@@ -5178,40 +5664,7 @@ class ScanBox(wx.Frame):
                 "Scanner unavailable",
             )
             return None
-        try:
-            listed = subprocess.run(
-                [MACOS_CAPTURE_HELPER, "list-scanners"],
-                check=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                # Wi-Fi scanners are often advertised after local devices.
-                # The native helper deliberately waits up to 30 seconds for
-                # them, so ScanBox must not kill it beforehand.
-                timeout=40,
-            )
-            logger.info(
-                "macOS scanner discovery stdout=%r stderr=%r",
-                listed.stdout,
-                listed.stderr,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.exception("Could not enumerate macOS scanners")
-            wx.MessageBox(
-                f"ScanBox could not look for connected scanners.\n\n{exc}",
-                "Scanner unavailable",
-            )
-            return None
-
-        scanners = []
-        for line in listed.stdout.splitlines():
-            kind, separator, value = line.partition("\t")
-            if kind != "scanner" or not separator:
-                continue
-            identifier, separator, name = value.partition("\t")
-            if identifier and separator:
-                scanners.append((identifier, name or "Unnamed scanner"))
+        scanners = self.available_scanners()
         if not scanners:
             logger.warning("macOS ImageCaptureCore reported no scanners")
             wx.MessageBox(
@@ -5221,22 +5674,16 @@ class ScanBox(wx.Frame):
             )
             return None
 
-        selected = 0
-        if len(scanners) > 1:
-            dialog = wx.SingleChoiceDialog(
-                self,
-                "Choose the scanner to use.",
-                "Select scanner",
-                [name for _identifier, name in scanners],
-            )
-            try:
-                if dialog.ShowModal() != wx.ID_OK:
-                    return None
-                selected = dialog.GetSelection()
-            finally:
-                dialog.Destroy()
-
-        identifier, name = scanners[selected]
+        scanner = self.selected_scanner(scanners)
+        if scanner is None:
+            if self.app_settings.get("scanner_id", ""):
+                wx.MessageBox(
+                    "The scanner selected in Settings is not available. Connect "
+                    "it or choose another scanner in Settings.",
+                    "Scanner not found",
+                )
+            return None
+        identifier, name = scanner["id"], scanner["name"]
         announce(f"Scanning with {name}. Please wait.")
         try:
             result = subprocess.run(
@@ -5419,6 +5866,33 @@ class ScanBox(wx.Frame):
                 dialog.Destroy()
         return selected_index
 
+    def open_camera_capture_device(self, camera_index):
+        """Open and retain a camera so bridge devices remain initialised."""
+        self.close_camera_capture_device()
+        camera = cv2.VideoCapture(camera_index, self.camera_backend())
+        self.camera_capture_device = camera
+        try:
+            buffer_property = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
+            if buffer_property is not None:
+                camera.set(buffer_property, 1)
+        except Exception:
+            logger.debug("Camera backend does not support buffer sizing", exc_info=True)
+        logger.info(
+            "Opened camera index %s; opened=%s",
+            camera_index,
+            camera.isOpened(),
+        )
+        return camera
+
+    def close_camera_capture_device(self):
+        camera = getattr(self, "camera_capture_device", None)
+        self.camera_capture_device = None
+        if camera is not None:
+            try:
+                camera.release()
+            except Exception:
+                logger.exception("Could not release camera")
+
     def capture_camera_page(self, camera_index=None):
         """Capture one still from the default USB or built-in camera.
 
@@ -5464,7 +5938,10 @@ class ScanBox(wx.Frame):
                 )
                 _remove_quietly(path)
                 return None
-        camera = cv2.VideoCapture(camera_index, self.camera_backend())
+        camera = getattr(self, "camera_capture_device", None)
+        owns_camera = camera is None
+        if owns_camera:
+            camera = cv2.VideoCapture(camera_index, self.camera_backend())
         try:
             if not camera.isOpened():
                 permission_help = (
@@ -5480,15 +5957,20 @@ class ScanBox(wx.Frame):
                 )
                 return None
 
-            # Discard early frames while exposure and focus settle.
-            frame = None
-            for _ in range(20):
-                ok, candidate = camera.read()
-                if ok:
-                    frame = candidate
+            # Read over real elapsed time. Freedom Scientific's PEARL
+            # DirectShow bridge and some document cameras need time to start;
+            # rapid fixed-count reads can save a blank startup image.
+            frame, attempts = _read_settled_camera_frame(camera)
+            logger.info(
+                "Camera index %s capture completed after %s reads; frame=%s",
+                camera_index,
+                attempts,
+                None if frame is None else getattr(frame, "shape", "unknown"),
+            )
             if frame is None:
                 wx.MessageBox(
-                    "The camera did not return an image.",
+                    "The camera opened but did not return a usable image. Close "
+                    "other camera applications, reconnect the camera, and try again.",
                     "Camera capture failed",
                 )
                 return None
@@ -5506,7 +5988,8 @@ class ScanBox(wx.Frame):
             )
             return None
         finally:
-            camera.release()
+            if owns_camera:
+                camera.release()
 
     def photo_mode_blocked(self, is_photo_mode):
         """In photo mode the model is required, so check before capturing."""
@@ -5778,6 +6261,10 @@ class ScanBox(wx.Frame):
         self.camera_capture_interval = interval
         self.camera_capture_index = camera_index
         self.camera_capture_photo_mode = is_photo_mode
+        if sys.platform != "darwin":
+            # Open before the countdown and retain the DirectShow connection
+            # for every page in this capture workflow.
+            self.open_camera_capture_device(camera_index)
         self.update_controls()
         self.schedule_camera_capture(delay, first=True)
 
@@ -5842,6 +6329,7 @@ class ScanBox(wx.Frame):
 
     def complete_camera_workflow(self):
         self.camera_capture_timer.Stop()
+        self.close_camera_capture_device()
         self.camera_capture_active = False
         self.camera_capture_stopping = False
         self.camera_capture_index = None
@@ -6921,6 +7409,20 @@ class ScanBox(wx.Frame):
         # scans, which are already edge-to-edge.
         if detect_page:
             detect_and_crop_page(path)
+        # Choosing another local AI is an explicit request to use that model
+        # for document OCR, not merely as a fallback after native OCR.
+        external_attempted = external_ai_config(self.app_settings) is not None
+        if external_attempted:
+            vision_text = run_vision_task("transcribe", path)
+            if (
+                not vision_text.startswith("Local AI service")
+                and not looks_like_ocr_repetition_garbage(vision_text)
+            ):
+                return vision_text
+            logger.warning(
+                "External local AI OCR failed; falling back to native OCR: %s",
+                vision_text,
+            )
         if sys.platform == "win32":
             native_text = windows_ocr(path).strip()
             native_ocr_name = "Windows.Media.Ocr"
@@ -6934,7 +7436,7 @@ class ScanBox(wx.Frame):
             logger.info("Document OCR used %s", native_ocr_name)
             return native_text
 
-        if vision_ready("transcribe"):
+        if not external_attempted and vision_ready("transcribe"):
             vision_text = run_vision_task("transcribe", path)
             if not looks_like_ocr_repetition_garbage(vision_text):
                 return vision_text
@@ -7114,6 +7616,103 @@ class ScanBox(wx.Frame):
         general_panel.SetSizer(general_sizer)
         notebook.AddPage(general_panel, "General")
 
+        scanner_panel = wx.Panel(notebook)
+        _set_named_page_accessible(scanner_panel, "Scanner")
+        scanner_sizer = wx.BoxSizer(wx.VERTICAL)
+        saved_scanner_id = self.app_settings.get("scanner_id", "")
+        saved_scanner_name = self.app_settings.get(
+            "scanner_name", "Selected scanner"
+        )
+        scanner_options = (
+            [{"id": saved_scanner_id, "name": saved_scanner_name}]
+            if saved_scanner_id
+            else []
+        )
+        scanner_choices = ["Ask me each time"] + [
+            scanner["name"] for scanner in scanner_options
+        ]
+        scanner_choice = wx.Choice(scanner_panel, choices=scanner_choices)
+        scanner_choice.SetName("Choose default scanner")
+        scanner_choice.SetSelection(1 if scanner_options else 0)
+        scanner_status = wx.StaticText(scanner_panel, label="Looking for scanners…")
+        scanner_status.SetName("Scanner discovery status")
+        refresh_scanners_btn = wx.Button(scanner_panel, label="Find Scanners")
+        scanner_sizer.Add(
+            wx.StaticText(scanner_panel, label="Choose default scanner"),
+            0, wx.LEFT | wx.RIGHT | wx.TOP, 10,
+        )
+        scanner_sizer.Add(scanner_choice, 0, wx.ALL | wx.EXPAND, 10)
+        scanner_sizer.Add(scanner_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        scanner_sizer.Add(
+            refresh_scanners_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10
+        )
+        scanner_panel.SetSizer(scanner_sizer)
+        notebook.AddPage(scanner_panel, "Scanner")
+
+        def finish_scanner_discovery(scanners):
+            nonlocal scanner_options
+            try:
+                previous_id = (
+                    scanner_options[scanner_choice.GetSelection() - 1]["id"]
+                    if scanner_choice.GetSelection() > 0
+                    else ""
+                )
+                saved_missing = bool(
+                    saved_scanner_id
+                    and not any(
+                        scanner["id"] == saved_scanner_id for scanner in scanners
+                    )
+                )
+                scanner_options = (
+                    [{"id": saved_scanner_id, "name": saved_scanner_name}]
+                    if saved_missing
+                    else []
+                ) + scanners
+                scanner_choice.Clear()
+                scanner_choice.Append("Ask me each time")
+                names = [scanner["name"] for scanner in scanner_options]
+                for index, scanner in enumerate(scanner_options):
+                    label = scanner["name"]
+                    if saved_missing and index == 0:
+                        label += " (not currently detected)"
+                    if names.count(label) > 1:
+                        label += f" ({index + 1})"
+                    scanner_choice.Append(label)
+                selected = next(
+                    (
+                        index + 1 for index, scanner in enumerate(scanner_options)
+                        if scanner["id"] == previous_id
+                    ),
+                    0,
+                )
+                scanner_choice.SetSelection(selected)
+                scanner_status.SetLabel(
+                    f"Found {len(scanners)} scanner"
+                    + ("." if len(scanners) == 1 else "s.")
+                    if scanners
+                    else "No scanners were found."
+                )
+                refresh_scanners_btn.Enable(True)
+                scanner_panel.Layout()
+            except RuntimeError:
+                pass
+
+        def find_scanners(event=None):
+            refresh_scanners_btn.Enable(False)
+            scanner_status.SetLabel("Looking for scanners…")
+
+            def worker():
+                wx.CallAfter(finish_scanner_discovery, self.available_scanners())
+
+            threading.Thread(
+                target=worker,
+                name="ScanBox scanner discovery",
+                daemon=True,
+            ).start()
+
+        refresh_scanners_btn.Bind(wx.EVT_BUTTON, find_scanners)
+        find_scanners()
+
         if sys.platform == "darwin":
             permissions_panel = wx.Panel(notebook)
             _set_named_page_accessible(permissions_panel, "Permissions")
@@ -7219,6 +7818,21 @@ class ScanBox(wx.Frame):
         _set_named_page_accessible(ai_panel, "AI")
         ai_sizer = wx.BoxSizer(wx.VERTICAL)
 
+        ai_source = wx.RadioBox(
+            ai_panel,
+            label="AI source",
+            choices=[
+                "ScanBox local AI (recommended)",
+                "Another local AI on this computer",
+            ],
+            majorDimension=1,
+            style=wx.RA_SPECIFY_ROWS,
+        )
+        ai_source.SetSelection(
+            1 if self.app_settings.get("ai_provider") == "external" else 0
+        )
+        ai_sizer.Add(ai_source, 0, wx.ALL | wx.EXPAND, 10)
+
         model_ids = list(VISION_MODELS)
         model_labels = []
         for model_id in model_ids:
@@ -7238,6 +7852,54 @@ class ScanBox(wx.Frame):
         model_choice.SetSelection(model_ids.index(current_model) if current_model in model_ids else 0)
         ai_sizer.Add(wx.StaticText(ai_panel, label="Image description model"), 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
         ai_sizer.Add(model_choice, 0, wx.ALL | wx.EXPAND, 10)
+
+        find_local_ai_btn = wx.Button(ai_panel, label="Find Local AI")
+        found_ai_choice = wx.Choice(ai_panel, choices=[])
+        found_ai_choice.SetName("Detected local AI models")
+        external_results = []
+        saved_external = external_ai_config(self.app_settings)
+        if saved_external:
+            external_results.append({
+                **saved_external,
+                "label": (
+                    self.app_settings.get("external_ai_label", "Local AI")
+                    + ": " + saved_external["model"]
+                ),
+            })
+            found_ai_choice.Append(external_results[0]["label"])
+            found_ai_choice.SetSelection(0)
+        external_status = wx.StaticText(
+            ai_panel,
+            label=("Saved local AI connection." if saved_external else ""),
+        )
+        external_status.SetName("Local AI discovery status")
+        external_url_label = wx.StaticText(ai_panel, label="Server address (advanced)")
+        external_url = wx.TextCtrl(
+            ai_panel,
+            value=self.app_settings.get("external_ai_url", ""),
+        )
+        external_url.SetName("Local AI server address")
+        external_model_label = wx.StaticText(ai_panel, label="Model name (advanced)")
+        external_model = wx.TextCtrl(
+            ai_panel,
+            value=self.app_settings.get("external_ai_model", ""),
+        )
+        external_model.SetName("Local AI model name")
+        external_url_label.Hide()
+        external_url.Hide()
+        external_model_label.Hide()
+        external_model.Hide()
+        ai_sizer.Add(find_local_ai_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        ai_sizer.Add(
+            wx.StaticText(ai_panel, label="Detected local AI models"),
+            0, wx.LEFT | wx.RIGHT | wx.TOP, 10,
+        )
+        ai_sizer.Add(found_ai_choice, 0, wx.ALL | wx.EXPAND, 10)
+        ai_sizer.Add(external_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        ai_sizer.Add(external_url_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        ai_sizer.Add(external_url, 0, wx.ALL | wx.EXPAND, 10)
+        ai_sizer.Add(external_model_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        ai_sizer.Add(external_model, 0, wx.ALL | wx.EXPAND, 10)
 
         install_ai_btn = wx.Button(ai_panel, label="Install or update local AI model")
         cancel_install_btn = wx.Button(ai_panel, label="Cancel AI Download")
@@ -7262,6 +7924,7 @@ class ScanBox(wx.Frame):
             )
 
         def refresh_model_controls():
+            builtin_selected = ai_source.GetSelection() == 0
             for index, model_id in enumerate(model_ids):
                 if self.installing and self._installing_model_id == model_id:
                     state = "installing"
@@ -7272,15 +7935,75 @@ class ScanBox(wx.Frame):
                     index, f"{model.get('choice_label', model['name'])}; {state}"
                 )
             selected_id = model_ids[model_choice.GetSelection()]
-            delete_model_btn.Enable(model_is_installed(selected_id))
-            install_ai_btn.Enable(not self.installing)
+            delete_model_btn.Enable(
+                builtin_selected and model_is_installed(selected_id)
+            )
+            install_ai_btn.Enable(builtin_selected and not self.installing)
             cancel_install_btn.Show(self.installing)
             cancel_install_btn.Enable(self.installing)
-            model_choice.Enable(not self.installing)
+            model_choice.Enable(builtin_selected and not self.installing)
+            find_local_ai_btn.Enable(not builtin_selected)
+            found_ai_choice.Enable(not builtin_selected)
+            external_url.Enable(not builtin_selected)
+            external_model.Enable(not builtin_selected)
             ai_panel.Layout()
 
         self._refresh_ai_model_controls = refresh_model_controls
         refresh_model_controls()
+
+        def select_external_result(event=None):
+            selected = found_ai_choice.GetSelection()
+            if 0 <= selected < len(external_results):
+                item = external_results[selected]
+                external_url.SetValue(item["url"])
+                external_model.SetValue(item["model"])
+                external_status.SetLabel(f"Selected {item['label']}.")
+                ai_panel.Layout()
+
+        def find_local_ai(event=None):
+            nonlocal external_results
+            external_status.SetLabel("Looking for local AI services…")
+            ai_panel.Layout()
+            wx.SafeYield(ai_panel, onlyIfNeeded=True)
+            results = discover_local_ai_models()
+            external_results = results
+            found_ai_choice.Clear()
+            for item in results:
+                found_ai_choice.Append(item["label"])
+            if results:
+                wanted = (
+                    self.app_settings.get("external_ai_kind", ""),
+                    self.app_settings.get("external_ai_url", ""),
+                    self.app_settings.get("external_ai_model", ""),
+                )
+                selected = next(
+                    (
+                        index for index, item in enumerate(results)
+                        if (item["kind"], item["url"], item["model"]) == wanted
+                    ),
+                    0,
+                )
+                found_ai_choice.SetSelection(selected)
+                select_external_result()
+                external_status.SetLabel(
+                    f"Found {len(results)} local AI model"
+                    + ("." if len(results) == 1 else "s.")
+                )
+                found_ai_choice.SetFocusFromKbd()
+            else:
+                external_status.SetLabel(
+                    "No local AI service was found. Start it and try again, "
+                    "or enter its server address and model name."
+                )
+                external_url_label.Show()
+                external_url.Show()
+                external_model_label.Show()
+                external_model.Show()
+            ai_panel.Layout()
+
+        ai_source.Bind(wx.EVT_RADIOBOX, lambda event: refresh_model_controls())
+        find_local_ai_btn.Bind(wx.EVT_BUTTON, find_local_ai)
+        found_ai_choice.Bind(wx.EVT_CHOICE, select_external_result)
 
         def on_install_model(event):
             selected_index = model_choice.GetSelection()
@@ -7383,14 +8106,62 @@ class ScanBox(wx.Frame):
                 self.app_settings["camera_capture_count"] = (
                     camera_count.GetValue()
                 )
+                scanner_selection = scanner_choice.GetSelection()
+                selected_scanner = (
+                    scanner_options[scanner_selection - 1]
+                    if 0 < scanner_selection <= len(scanner_options)
+                    else None
+                )
+                self.app_settings["scanner_id"] = (
+                    selected_scanner["id"] if selected_scanner else ""
+                )
+                self.app_settings["scanner_name"] = (
+                    selected_scanner["name"]
+                    if selected_scanner else "Ask me each time"
+                )
                 logging_changed = (
                     self.app_settings.get("diagnostic_logging", False)
                     != diagnostic_logging.GetValue()
                 )
                 self.app_settings["diagnostic_logging"] = diagnostic_logging.GetValue()
                 self.app_settings["vision_model"] = model_ids[model_choice.GetSelection()]
+                self.app_settings["ai_provider"] = (
+                    "external" if ai_source.GetSelection() == 1 else "builtin"
+                )
+                if self.app_settings["ai_provider"] == "external":
+                    selected_external = found_ai_choice.GetSelection()
+                    selected_item = (
+                        external_results[selected_external]
+                        if 0 <= selected_external < len(external_results)
+                        else None
+                    )
+                    self.app_settings["external_ai_kind"] = (
+                        selected_item["kind"]
+                        if selected_item
+                        else _local_ai_kind_for_url(external_url.GetValue())
+                    )
+                    self.app_settings["external_ai_label"] = (
+                        selected_item["name"] if selected_item else "Local AI"
+                    )
+                    self.app_settings["external_ai_url"] = _normalise_local_ai_url(
+                        external_url.GetValue()
+                    )
+                    self.app_settings["external_ai_model"] = (
+                        external_model.GetValue().strip()
+                    )
+                    if external_ai_config(self.app_settings) is None:
+                        self.app_settings["ai_provider"] = "builtin"
+                        wx.MessageBox(
+                            "The local AI connection was incomplete, so ScanBox "
+                            "will continue using its built-in AI.",
+                            "Local AI not selected",
+                            wx.OK | wx.ICON_INFORMATION,
+                            self,
+                        )
                 write_app_settings(self.app_settings)
-                if self.app_settings["vision_model"] == "qwen3_vl_2b":
+                if self.app_settings["ai_provider"] == "external":
+                    stop_mtmd_server()
+                elif self.app_settings["vision_model"] == "qwen3_vl_2b":
                     threading.Thread(
                         target=start_mtmd_server,
                         args=("qwen3_vl_2b",),
@@ -7436,6 +8207,7 @@ class ScanBox(wx.Frame):
             # so stop those workflows before the delayed exit announcement.
             self.camera_capture_timer.Stop()
             self.camera_capture_active = False
+            self.close_camera_capture_device()
             if self.camera_alignment_stop_event is not None:
                 self.camera_alignment_stop_event.set()
             self.camera_alignment_active = False
@@ -7448,6 +8220,7 @@ class ScanBox(wx.Frame):
                 return
         self.camera_capture_timer.Stop()
         self.camera_capture_active = False
+        self.close_camera_capture_device()
         if self.camera_alignment_stop_event is not None:
             self.camera_alignment_stop_event.set()
             self.camera_alignment_stop_event = None

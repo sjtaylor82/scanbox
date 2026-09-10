@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026.9.2
+
+- Added Windows executable product/version metadata for JAWS's application
+  version command.
+- Fixed external AI OCR truncation handling and TIFF image uploads. Screen
+  OCR now uses the selected local service first, with native OCR fallback.
+- Fixed scanner discovery resetting the Ask me each time selection.
+- Fixed Qwen installations after the upstream llama.cpp latest release stopped
+  publishing runtime archives. ScanBox now uses a pinned, tested runtime.
+- Added automatic startup repair when Qwen is installed without its runner, or
+  when an older Windows installation has only the CPU runner. Existing model
+  files are retained, and the normal accessible download progress is shown.
+- Added Settings > AI discovery for Ollama, LM Studio and vLLM services running
+  on this computer. Every model returned by every detected service is listed,
+  and the selected service can handle scans, camera captures, screenshots,
+  document OCR, descriptions and image questions. ScanBox connects only to a
+  service on the local computer.
+- Moved scanner selection to Settings > Scanner. Users can save any detected
+  scanner or choose Ask me each time; scan commands no longer ask when a saved
+  scanner is available.
+- Improved support for Freedom Scientific PEARL and other DirectShow bridge
+  cameras. ScanBox now opens the camera before the countdown, keeps it open
+  between captures, waits for it to settle and ignores blank startup frames.
+
 ## 2026.9.1
 
 - Kept the Results area keyboard accessible during Control+backslash and

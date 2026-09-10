@@ -82,8 +82,9 @@ Press <kbd>F1</kbd> at any time to open this guide.</p>
   <li><strong>FaceAlign</strong> announces the position of your face in a front-facing camera.</li>
 </ul>
 
-<p>These commands are the same on Windows and macOS. If more than one suitable
-device is connected, ScanBox asks which one to use.</p>
+<p>These commands are the same on Windows and macOS. The Scanner page in
+Settings lists every detected scanner. Choose one to use it directly, or choose
+<strong>Ask me each time</strong> to select during the scan workflow.</p>
 
 <h3>Camera timing</h3>
 
@@ -154,6 +155,18 @@ descriptions. Printed document OCR works without either model.</p>
 over integrated graphics when Qwen uses Vulkan. Choose <strong>Local AI
 Acceleration</strong> from the Help menu to hear the active model and the
 graphics processor used by the current or most recent description.</p>
+
+<h3>Another local AI</h3>
+
+<p>If Ollama, LM Studio or vLLM is already running on this computer, choose
+<strong>Another local AI on this computer</strong>, then choose
+<strong>Find Local AI</strong>. ScanBox lists every model returned by every
+detected service. Select the model you want to use for document OCR, image
+descriptions and image questions.</p>
+
+<p>ScanBox restricts these connections to this computer, and built-in ScanBox
+AI remains the default. The selected local service controls its own network and
+privacy behaviour.</p>
 
 <h2 id="other-apps">7. Describe Another Application</h2>
 

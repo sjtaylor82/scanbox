@@ -53,7 +53,8 @@ What you need
   Windows scanner capture uses Windows Image Acquisition (WIA), so a scanner
   with a WIA driver works. USB/UVC cameras use OpenCV's Windows camera backend
   and do not need to appear as WIA scanners. Scanner and camera discovery are
-  separate, so one device type cannot take precedence over the other.
+  separate, so one device type cannot take precedence over the other. Settings
+  > Scanner lists every detected scanner and also offers Ask me each time.
   A front-facing camera can describe objects held in view. It can also attempt
   document capture, although a stable USB document camera normally gives OCR a
   clearer, more squarely positioned page.
@@ -115,6 +116,22 @@ Available models
   over integrated graphics. Help > Local AI Acceleration reports the active
   model and the graphics processor used by the current or latest description.
 
+Another local AI
+----------------
+
+Settings > AI can connect ScanBox to AI software already running on this
+computer. Choose "Another local AI on this computer", then choose Find Local
+AI. ScanBox lists every model returned by detected Ollama, LM Studio and vLLM
+services; select the one to use. Scans, camera captures, imported images and
+screenshots remain handled by ScanBox, while document OCR, descriptions and
+image questions are sent to the selected loopback service. If no service is
+detected, advanced server-address and model-name fields become available.
+
+External local AI addresses are restricted to localhost and built-in ScanBox
+AI remains the default. The selected local service controls its own network and
+privacy behaviour, so configure that service separately if it can use cloud
+providers.
+
 Screen workflows
 ----------------
 
@@ -163,6 +180,12 @@ To create an isolated, folder-based Windows build, run:
 The build script creates a private environment under `temp`, installs the
 declared runtime and packaging dependencies, and writes the application to
 `dist\ScanBox`.
+
+The Windows executable embeds the product name and version from `APP_NAME`
+and `APP_VERSION` in `scanbox.py`, allowing JAWS's application-version command
+and Windows file properties to identify the release. Rebuild the executable
+after changing the version; running the Python source directly exposes the
+Python host executable's metadata instead.
 
 On macOS, install `requirements-macos.txt`. The native helper and application
 bundle must be built on a Mac with Xcode command-line tools available:
