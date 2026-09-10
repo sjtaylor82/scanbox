@@ -7,7 +7,9 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from version_resource import announcement, read_version_strings, verify_release_metadata
+from version_resource import (
+    announcement, read_version_strings, release_targets, verify_release_metadata,
+)
 
 
 root = Path(__file__).resolve().parent.parent
@@ -67,19 +69,55 @@ for node in ast.parse((root / "scanbox.py").read_text(encoding="utf-8")).body:
         for target in node.targets:
             if isinstance(target, ast.Name) and target.id in {"APP_NAME", "APP_VERSION"}:
                 app_constants[target.id] = ast.literal_eval(node.value)
-problems = verify_release_metadata(
-    app_dir / "ScanBox.exe",
-    app_constants["APP_NAME"],
-    app_constants["APP_VERSION"],
-)
-if problems:
+app_name = app_constants["APP_NAME"]
+app_version = app_constants["APP_VERSION"]
+
+# A screen reader asked to identify the active application reads the file that
+# created the focused window, which for a wxPython program is wx's compiled
+# core rather than ScanBox.exe. wxPython ships that file with no version
+# resource at all, so stamp ScanBox's own identity into every file that could
+# be asked. Use the build interpreter, which already has PyInstaller.
+targets = release_targets(app_dir)
+if len(targets) < 2:
     raise SystemExit(
-        "Windows build has unusable screen-reader version metadata: "
-        + "; ".join(problems)
+        "Could not find wxPython's compiled core in the build; a screen reader "
+        "would have no version to announce for the active application."
+    )
+for target in targets:
+    if read_version_strings(target):
+        continue
+    subprocess.run(
+        [str(venv_python), str(Path(__file__).resolve().parent / "version_resource.py"),
+         "--stamp", str(target), app_name, app_version],
+        check=True,
+        cwd=root,
     )
 
-print(f"ScanBox for Windows: {app_dir}")
-print(
-    "Screen readers will announce: "
-    + announcement(read_version_strings(app_dir / "ScanBox.exe"))
+# Stamping rewrites a binary that Python has to load. Prove the packaged
+# wxPython still imports before this build is allowed to become a release.
+check = subprocess.run(
+    [str(venv_python), "-c",
+     "import sys; sys.path.insert(0, sys.argv[1]); import wx; print(wx.version())",
+     str(app_dir / "_internal")],
+    capture_output=True, text=True, cwd=root,
 )
+if check.returncode != 0:
+    raise SystemExit(
+        "The packaged wxPython no longer imports after stamping:" + chr(10) + check.stderr
+    )
+print(f"Packaged wxPython still imports: {check.stdout.strip()}")
+
+for target in targets:
+    problems = verify_release_metadata(target, app_name, app_version)
+    if problems:
+        raise SystemExit(
+            f"{target.name} has unusable screen-reader version metadata: "
+            + "; ".join(problems)
+        )
+
+print(f"ScanBox for Windows: {app_dir}")
+for target in targets:
+    print(
+        f"  {target.name} announces: "
+        + announcement(read_version_strings(target))
+    )

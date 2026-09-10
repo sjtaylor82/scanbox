@@ -2,9 +2,13 @@
 
 ## 2026.9.4
 
-- Refuse to finish a Windows build unless asking the active application for
-  its version announces exactly "ScanBox version <number>", and refuse to
-  build a macOS release whose version disagrees with the release tag.
+- Asking Windows for the active application's version now answers
+  "ScanBox version <number>". A screen reader reads the file that created the
+  focused window, which for ScanBox is wxPython's compiled core rather than
+  ScanBox.exe, and that file carried no version information at all.
+- Refuse to finish a Windows build unless every file that could be asked
+  announces exactly "ScanBox version <number>", and refuse to build a macOS
+  release whose version disagrees with the release tag.
 - Keep only the most recent retained copy of a replaced build. Earlier copies
   and abandoned staging folders are removed at startup, instead of holding
   roughly 300 MB per update indefinitely.

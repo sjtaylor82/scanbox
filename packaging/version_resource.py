@@ -121,8 +121,8 @@ def announcement(strings):
     JAWS supplies the word "version" itself, so a resource naming only the
     application and its number is read as "ScanBox version 2026.9.3".
     """
-    name = strings.get("FileDescription") or strings.get("ProductName")
-    number = strings.get("FileVersion") or strings.get("ProductVersion")
+    name = strings.get("ProductName") or strings.get("FileDescription")
+    number = strings.get("ProductVersion") or strings.get("FileVersion")
     if not name or not number:
         return ""
     return f"{name} version {number}"
@@ -160,7 +160,51 @@ def verify_release_metadata(path, app_name, app_version):
     return problems
 
 
+# JAWS resolves the focused window to the module that created it, not to the
+# process executable. ScanBox's windows are created by wxPython's compiled
+# core, so that file is what answers Ctrl+Insert+V and it must carry the
+# application's own name and version.
+WINDOW_OWNING_MODULE = "wx/_core*.pyd"
+
+
+def release_targets(app_dir):
+    """Return every file that must answer the version question correctly."""
+    app_dir = Path(app_dir)
+    targets = [app_dir / "ScanBox.exe"]
+    targets.extend(sorted((app_dir / "_internal" / "wx").glob("_core*.pyd")))
+    return targets
+
+
+def stamp_version_resource(path, app_name, app_version):
+    """Write ScanBox's identity into a binary that has no version resource."""
+    from PyInstaller.utils.win32.versioninfo import (
+        VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable, StringStruct,
+        VarFileInfo, VarStruct, write_version_info_to_executable,
+    )
+
+    parts = tuple(int(part) for part in app_version.split("."))
+    numeric = parts + (0,) * (4 - len(parts))
+    write_version_info_to_executable(str(path), VSVersionInfo(
+        ffi=FixedFileInfo(filevers=numeric, prodvers=numeric, mask=0x3F, flags=0,
+                          OS=0x40004, fileType=2, subtype=0, date=(0, 0)),
+        kids=[
+            StringFileInfo([StringTable("040904B0", [
+                StringStruct("ProductName", app_name),
+                StringStruct("ProductVersion", app_version),
+                StringStruct("FileDescription", app_name),
+                StringStruct("FileVersion", app_version),
+            ])]),
+            VarFileInfo([VarStruct("Translation", [0x0409, 1200])]),
+        ],
+    ))
+
+
 def _main(argv):
+    if argv and argv[0] == "--stamp":
+        _, target, app_name, app_version = argv
+        stamp_version_resource(target, app_name, app_version)
+        print(f"Stamped {app_name} {app_version} into {target}")
+        return 0
     if argv:
         target = argv[0]
     else:

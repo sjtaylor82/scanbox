@@ -134,16 +134,37 @@ class VersionResourceTests(unittest.TestCase):
             self.assertTrue(any("CompanyName" in problem for problem in problems))
             self.assertTrue(any("LegalCopyright" in problem for problem in problems))
 
-    def test_packaged_executable_announces_the_current_version(self):
-        packaged = Path(scanbox.__file__).parent / "dist" / "ScanBox" / "ScanBox.exe"
-        if not packaged.is_file():
+    def test_release_targets_include_the_window_owning_module(self):
+        """JAWS reads the module that created the window, not ScanBox.exe."""
+        app_dir = Path(scanbox.__file__).parent / "dist" / "ScanBox"
+        if not app_dir.is_dir():
             self.skipTest("No packaged Windows build in dist/")
 
-        problems = version_resource.verify_release_metadata(
-            packaged, scanbox.APP_NAME, scanbox.APP_VERSION
+        targets = version_resource.release_targets(app_dir)
+
+        self.assertEqual(targets[0].name, "ScanBox.exe")
+        self.assertTrue(
+            any(t.name.startswith("_core") and t.suffix == ".pyd" for t in targets),
+            f"wxPython's compiled core is missing from {targets}",
         )
 
-        self.assertEqual(problems, [], "; ".join(problems))
+    def test_every_packaged_target_announces_the_current_version(self):
+        app_dir = Path(scanbox.__file__).parent / "dist" / "ScanBox"
+        if not app_dir.is_dir():
+            self.skipTest("No packaged Windows build in dist/")
+
+        for target in version_resource.release_targets(app_dir):
+            with self.subTest(target=target.name):
+                problems = version_resource.verify_release_metadata(
+                    target, scanbox.APP_NAME, scanbox.APP_VERSION
+                )
+                self.assertEqual(problems, [], "; ".join(problems))
+                self.assertEqual(
+                    version_resource.announcement(
+                        version_resource.read_version_strings(target)
+                    ),
+                    f"{scanbox.APP_NAME} version {scanbox.APP_VERSION}",
+                )
 
 
 if __name__ == "__main__":
