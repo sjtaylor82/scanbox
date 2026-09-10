@@ -264,6 +264,11 @@ An internet connection is used in the following circumstances:
     it does not upload documents, images, screenshots, or recognised text.
     Portable Windows and macOS builds can download and install an accepted
     update automatically. User settings and downloaded AI models are retained.
+    On Windows, the updater prepares the replacement before ScanBox closes,
+    retains a backup of the old application, and attempts rollback if replacement
+    fails. Update details are always written to `update.log` in the portable
+    data folder (normally beside `ScanBox.exe`); the ordinary diagnostic log is
+    `output/scanbox.log`. Preparation failures leave ScanBox open.
   - Installing or updating a local AI model downloads the required model files
     from their published source.
   - Import PDF from Current Browser Tab downloads the public HTTPS PDF shown in

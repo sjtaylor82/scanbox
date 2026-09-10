@@ -54,7 +54,7 @@ from fpdf import FPDF
 from PIL import Image, ImageGrab, ImageOps, UnidentifiedImageError
 
 APP_NAME = "ScanBox"
-APP_VERSION = "2026.9.2"
+APP_VERSION = "2026.9.3"
 UPDATE_MANIFEST_URL = os.environ.get(
     "SCANBOX_UPDATE_MANIFEST_URL",
     "https://api.github.com/repos/sjtaylor82/scanbox/releases/latest",
@@ -118,27 +118,40 @@ def _launch_portable_updater(payload_path):
         install_dir = os.path.abspath(BASE)
         script_path = os.path.join(tempfile.gettempdir(), f"scanbox-update-{token}.ps1")
 
-        def quote(value):
-            return "'" + str(value).replace("'", "''") + "'"
-
-        script = (
-            "$ErrorActionPreference = 'Stop'\n"
-            f"Wait-Process -Id {process_id}\n"
-            f"$payload = {quote(payload_path)}\n"
-            f"$install = {quote(install_dir)}\n"
-            "Get-ChildItem -LiteralPath $payload | "
-            "Copy-Item -Destination $install -Recurse -Force\n"
-            f"Start-Process -FilePath {quote(os.path.join(install_dir, 'ScanBox.exe'))}\n"
-        )
-        with open(script_path, "w", encoding="utf-8", newline="\r\n") as script_file:
+        ready_path = script_path + ".ready"
+        log_path = os.path.join(DATA_DIR, "update.log")
+        source = os.path.join(RESOURCE_BASE, "portable_updater.ps1")
+        # A BOM lets Windows PowerShell correctly read non-ASCII paths.
+        with open(source, encoding="utf-8-sig") as source_file:
+            script = source_file.read()
+        with open(script_path, "w", encoding="utf-8-sig") as script_file:
             script_file.write(script)
-        subprocess.Popen(
-            [
-                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                "-File", script_path,
-            ],
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        logger.info("Starting portable updater; update log: %s", log_path)
+        with open(log_path, "ab") as update_log:
+            helper = subprocess.Popen(
+                [
+                    "powershell.exe", "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass", "-File", script_path,
+                    "-ScanBoxProcessId", str(process_id),
+                    "-PayloadPath", payload_path, "-AppDirectory", install_dir,
+                    "-ReadyPath", ready_path, "-LogPath", log_path,
+                ],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                close_fds=True, stdout=update_log, stderr=subprocess.STDOUT,
+            )
+        deadline = time.monotonic() + 300
+        while not os.path.isfile(ready_path):
+            if helper.poll() is not None:
+                raise RuntimeError(f"Updater stopped during preparation. See {log_path}")
+            if time.monotonic() >= deadline:
+                helper.terminate()
+                helper.wait(timeout=10)
+                raise RuntimeError(f"Updater preparation timed out. See {log_path}")
+            time.sleep(0.2)
+        status = Path(ready_path).read_text(encoding="ascii").strip()
+        os.remove(ready_path)
+        if status != "ready":
+            raise RuntimeError(f"Updater preparation failed. See {log_path}")
         return
     if sys.platform == "darwin":
         current_app = str(Path(sys.executable).resolve().parents[2])
@@ -3801,6 +3814,14 @@ class ScanBox(wx.Frame):
         # manually maximizing was needed before NVDA had a comfortable
         # amount of visible text to work with.
         self.Maximize(True)
+        update_failure_log = os.environ.pop("SCANBOX_UPDATE_FAILED", "")
+        if update_failure_log:
+            wx.CallAfter(
+                wx.MessageBox,
+                "The update could not be completed. ScanBox attempted to "
+                "restore the previous version.\n\nDetails: " + update_failure_log,
+                "ScanBox update failed", wx.OK | wx.ICON_ERROR, self,
+            )
         # On macOS, privacy prompts from helpers can appear behind other
         # windows if several background tasks start at once. Sequence the
         # permission prompts before the hotkey helper and model preload.
@@ -4178,6 +4199,7 @@ class ScanBox(wx.Frame):
                 lambda message: wx.CallAfter(self.SetStatusText, message),
             )
             payload_path = _prepare_update_payload(archive_path)
+            _launch_portable_updater(payload_path)
             result = (payload_path, None)
         except Exception as exc:
             logger.exception("Could not download or prepare ScanBox update")
@@ -4190,18 +4212,6 @@ class ScanBox(wx.Frame):
             self.SetStatusText("ScanBox update failed.")
             wx.MessageBox(
                 f"ScanBox could not install the update.\n\n{error}",
-                "Update Failed",
-                wx.OK | wx.ICON_ERROR,
-                self,
-            )
-            return
-        try:
-            _launch_portable_updater(payload_path)
-        except Exception as exc:
-            logger.exception("Could not launch ScanBox updater")
-            self.SetStatusText("ScanBox update failed.")
-            wx.MessageBox(
-                f"ScanBox could not launch the updater.\n\n{exc}",
                 "Update Failed",
                 wx.OK | wx.ICON_ERROR,
                 self,

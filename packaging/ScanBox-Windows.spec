@@ -46,6 +46,7 @@ if not face_detector.is_file():
     )
 
 datas = [
+    (str(project / "packaging" / "portable_updater.ps1"), "."),
     (str(project / "manual.html"), "."),
     (str(project / "LICENSE"), "."),
     (str(project / "SHUTTER.WAV"), "."),

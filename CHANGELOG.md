@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026.9.3
+
+- Fixed the Windows portable updater aborting when ScanBox had already exited.
+- Prepare the replacement before closing ScanBox, retain the previous
+  application files, and attempt rollback if replacement fails.
+- Write updater progress and errors to `update.log` in the portable data folder
+  (normally beside `ScanBox.exe`). Preparation errors leave ScanBox open.
+- Retain settings, downloaded AI models, images and output during updates.
+- macOS is rebuilt as 2026.9.3; its update mechanism is unchanged.
+
 ## 2026.9.2
 
 - Added Windows executable product/version metadata for JAWS's application
