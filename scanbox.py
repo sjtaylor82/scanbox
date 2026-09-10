@@ -467,10 +467,27 @@ _mtmd_gpu_out_of_memory = False
 _mtmd_server_backend = None
 _mtmd_active_backend = None
 _mtmd_last_backend = None
+# The graphics processor a run was actually started with. Recorded rather than
+# recalculated, so the acceleration report describes what happened instead of
+# repeating a choice that may since have changed.
+_mtmd_server_device = None
+_mtmd_active_device = None
+_mtmd_last_device = None
 
+# Metal reports exhaustion through its command-buffer callback; Vulkan reports
+# it through the allocator. Missing the Vulkan wording left Windows with no
+# automatic CPU retry at all, which is the platform most likely to select a
+# small dedicated card.
 _MTMD_GPU_OOM_MARKERS = (
     "kIOGPUCommandBufferCallbackErrorOutOfMemory",
     "Insufficient Memory",
+    "ErrorOutOfDeviceMemory",
+    "ErrorOutOfHostMemory",
+    "out of device memory",
+    "Device memory allocation of size",
+    "failed to allocate device memory",
+    "vk::Device::allocateMemory",
+    "ggml_backend_vk_buffer_type_alloc_buffer: failed",
 )
 
 
@@ -1731,8 +1748,59 @@ def _parse_mtmd_devices(output):
     return devices
 
 
-def _preferred_mtmd_device(runner):
-    """Prefer a likely discrete Vulkan GPU, then the strongest available device."""
+def _mtmd_model_memory_requirement_mib(files):
+    """Estimate the device memory a fully offloaded model run needs."""
+    try:
+        weights = sum(os.path.getsize(path) for path in files) / (1024 * 1024)
+    except OSError:
+        return 0
+    # The weights dominate; the rest is context, image tokens and working
+    # buffers. A card that cannot hold this will not run the model offloaded.
+    return int(weights * 1.2) + 512
+
+
+_mtmd_server_diagnostics = None
+
+
+def _consume_mtmd_server_diagnostics():
+    """Read and discard the persistent service's stderr, reporting exhaustion.
+
+    The service used to be launched with its diagnostics discarded, so a load
+    that failed for lack of device memory looked identical to one that simply
+    never became ready.
+    """
+    global _mtmd_server_diagnostics, _mtmd_gpu_out_of_memory
+    path, _mtmd_server_diagnostics = _mtmd_server_diagnostics, None
+    if not path:
+        return
+    try:
+        with open(path, encoding="utf-8", errors="replace") as diagnostics_file:
+            diagnostics = diagnostics_file.read()
+    except OSError:
+        diagnostics = ""
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if not diagnostics.strip():
+        return
+    logger.debug("Persistent image model diagnostics:%s%s", chr(10), diagnostics.strip()[-4000:])
+    if _mtmd_diagnostics_show_gpu_oom(diagnostics):
+        _mtmd_gpu_out_of_memory = True
+        logger.warning(
+            "The graphics processor ran out of memory loading the image model; "
+            "this session will use the processor instead."
+        )
+
+
+def _preferred_mtmd_device(runner, required_mib=0):
+    """Prefer a device that can hold the model, then a likely discrete GPU.
+
+    Choosing purely by vendor sent the model to a small dedicated card in
+    preference to an integrated one with far more memory available, which is
+    a slower failure than not using the dedicated card at all.
+    """
     if "vulkan" not in runner.lower():
         return None
     try:
@@ -1756,15 +1824,30 @@ def _preferred_mtmd_device(runner):
             tier = 4
         elif "nvidia" in label:
             tier = 3
+        # Intel's discrete Arc cards carry a model number; the integrated
+        # parts sharing the Arc name do not.
+        elif re.search(r"\barc\b.*\b[ab]\d{3}\b", label):
+            tier = 3
         elif "amd" in label or "radeon" in label:
             tier = 2
         elif "intel" in label:
             tier = 1
         else:
             tier = 0
-        return tier, device["free_mib"], device["memory_mib"]
+        fits = 1 if device["free_mib"] >= required_mib else 0
+        # Among cards that can hold the model, prefer the dedicated one. If
+        # none can, the roomiest is the likeliest to work at all, so brand
+        # stops counting.
+        return fits, tier if fits else 0, device["free_mib"], device["memory_mib"]
 
-    return max(devices, key=preference)
+    selected = max(devices, key=preference)
+    if required_mib and selected["free_mib"] < required_mib:
+        logger.info(
+            "No Vulkan device reports the %d MiB this model needs; using %s "
+            "with %d MiB free and falling back to the processor if it runs out.",
+            required_mib, selected["label"], selected["free_mib"],
+        )
+    return selected
 
 
 def local_ai_acceleration_report(model_id):
@@ -1786,11 +1869,14 @@ def local_ai_acceleration_report(model_id):
     runners = _find_mtmd_runners()
     if not runners:
         return f"Active model: {model['name']}\nGraphics processor used: runner not installed."
-    runner = runners[0]
     actual_backend = _mtmd_active_backend or _mtmd_last_backend
     if actual_backend and actual_backend.startswith("GPU"):
-        selected = _preferred_mtmd_device(runner)
-        processor = selected["label"] if selected else actual_backend
+        # Report the device the run was actually started with. Asking the
+        # runner again would describe a fresh choice, which can differ from
+        # what is loaded, and this line is how someone checks whether their
+        # graphics card is being used at all.
+        recorded = _mtmd_active_device or _mtmd_last_device
+        processor = recorded or actual_backend
     elif actual_backend == "CPU":
         processor = "none; the most recent description used the CPU"
     else:
@@ -1921,12 +2007,14 @@ def _bind_process_lifetime_to_scanbox(process):
 def stop_mtmd_server():
     global _mtmd_server_process, _mtmd_server_port, _mtmd_server_model_id
     global _mtmd_server_loading, _mtmd_server_job, _mtmd_server_backend
+    global _mtmd_server_device
     with _mtmd_server_lock:
         process = _mtmd_server_process
         _mtmd_server_process = None
         _mtmd_server_port = None
         _mtmd_server_model_id = None
         _mtmd_server_backend = None
+        _mtmd_server_device = None
         loading = _mtmd_server_loading
         _mtmd_server_loading = None
         job = _mtmd_server_job
@@ -1959,6 +2047,7 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
     """Load Qwen once and keep it available for later descriptions."""
     global _mtmd_server_process, _mtmd_server_port, _mtmd_server_model_id
     global _mtmd_server_loading, _mtmd_server_job, _mtmd_server_backend
+    global _mtmd_server_device, _mtmd_server_diagnostics
     if model_id != "qwen3_vl_2b" or _total_physical_memory() < QWEN_PRELOAD_MINIMUM_RAM:
         return False
     files = _find_mtmd_model_files(model_id)
@@ -1988,7 +2077,10 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
     accelerated = (
         "vulkan" in runner.lower() or sys.platform == "darwin"
     ) and not _mtmd_gpu_out_of_memory
-    selected_device = _preferred_mtmd_device(runner) if accelerated else None
+    selected_device = (
+        _preferred_mtmd_device(runner, _mtmd_model_memory_requirement_mib(files))
+        if accelerated else None
+    )
     backend = _mtmd_backend_label(runner, accelerated)
     logger.info(
         "Starting persistent %s service; processor=%s device=%s runner=%s",
@@ -2009,12 +2101,18 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
     if selected_device:
         command.extend(["--device", selected_device["id"]])
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    _consume_mtmd_server_diagnostics()
+    diagnostics_path = os.path.join(
+        tempfile.gettempdir(), f"scanbox-image-model-{uuid.uuid4().hex}.log"
+    )
     try:
-        process = subprocess.Popen(
-            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            start_new_session=sys.platform != "win32",
-        )
+        with open(diagnostics_path, "wb") as diagnostics_file:
+            process = subprocess.Popen(
+                command, stdout=subprocess.DEVNULL, stderr=diagnostics_file,
+                creationflags=creationflags,
+                start_new_session=sys.platform != "win32",
+            )
+        _mtmd_server_diagnostics = diagnostics_path
         job = _bind_process_lifetime_to_scanbox(process)
         with _mtmd_server_lock:
             _mtmd_server_process = process
@@ -2034,6 +2132,9 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
                             backend,
                         )
                         _mtmd_server_backend = backend
+                        _mtmd_server_device = (
+                            selected_device["label"] if selected_device else None
+                        )
                         loading.set()
                         return True
             except (OSError, urllib.error.URLError):
@@ -2042,12 +2143,15 @@ def start_mtmd_server(model_id="qwen3_vl_2b"):
     except Exception:
         logger.exception("Could not start persistent local image model")
     loading.set()
+    # Stop first: the service still owns the diagnostics file until it exits.
     stop_mtmd_server()
+    _consume_mtmd_server_diagnostics()
     return False
 
 
 def _run_mtmd_server_task(prompt, image_path, max_tokens, cancel_event=None):
     global _mtmd_active_backend, _mtmd_last_backend
+    global _mtmd_active_device, _mtmd_last_device
     with _mtmd_server_lock:
         process = _mtmd_server_process
         port = _mtmd_server_port
@@ -2104,6 +2208,7 @@ def _run_mtmd_server_task(prompt, image_path, max_tokens, cancel_event=None):
     try:
         backend = _mtmd_server_backend or "CPU"
         _mtmd_active_backend = backend
+        _mtmd_active_device = _mtmd_server_device
         with urllib.request.urlopen(request, timeout=MTMD_TIMEOUT_SECONDS) as response:
             result = json.load(response)
         cancelled.set()
@@ -2112,6 +2217,7 @@ def _run_mtmd_server_task(prompt, image_path, max_tokens, cancel_event=None):
         text = result["choices"][0]["message"]["content"].strip()
         if text:
             _mtmd_last_backend = backend
+            _mtmd_last_device = _mtmd_active_device
         return text
     except Exception:
         cancelled.set()
@@ -2125,6 +2231,7 @@ def _run_mtmd_server_task(prompt, image_path, max_tokens, cancel_event=None):
         return None
     finally:
         _mtmd_active_backend = None
+        _mtmd_active_device = None
 
 
 class DownloadCancelled(Exception):
@@ -2260,6 +2367,7 @@ def run_mtmd_task(
     cancel_event=None,
 ):
     global _mtmd_gpu_out_of_memory, _mtmd_active_backend, _mtmd_last_backend
+    global _mtmd_active_device, _mtmd_last_device
     runners = _find_mtmd_runners()
     files = _find_mtmd_model_files(model_id)
     if not runners or not files:
@@ -2332,9 +2440,13 @@ def run_mtmd_task(
             "vulkan" in runner.lower() or sys.platform == "darwin"
         ) and not _mtmd_gpu_out_of_memory
         backend = _mtmd_backend_label(runner, accelerated)
-        selected_device = _preferred_mtmd_device(runner) if accelerated else None
+        selected_device = (
+            _preferred_mtmd_device(runner, _mtmd_model_memory_requirement_mib(files))
+            if accelerated else None
+        )
         try:
             _mtmd_active_backend = backend
+            _mtmd_active_device = selected_device["label"] if selected_device else None
             try:
                 result, cancelled = run_once(runner, accelerated, selected_device)
             finally:
@@ -2365,6 +2477,7 @@ def run_mtmd_task(
             backend = _mtmd_backend_label(runner, False)
             try:
                 _mtmd_active_backend = backend
+                _mtmd_active_device = None
                 try:
                     result, cancelled = run_once(runner, False)
                 finally:
@@ -2384,6 +2497,7 @@ def run_mtmd_task(
         text = (result.stdout or "").strip()
         if result.returncode == 0 and text:
             _mtmd_last_backend = backend
+            _mtmd_last_device = _mtmd_active_device
             logger.info("Local multimodal runner used: %s", runner)
             break
         failures.append((result.stderr or text or "No result was returned.").strip())

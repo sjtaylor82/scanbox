@@ -12,6 +12,19 @@
 - Keep only the most recent retained copy of a replaced build. Earlier copies
   and abandoned staging folders are removed at startup, instead of holding
   roughly 300 MB per update indefinitely.
+- Report the graphics processor a description actually ran on, rather than
+  working out afresh which one would be chosen now. The two can disagree, and
+  this line is how you check whether your graphics card is being used.
+- Choose a graphics card that can hold the model. Preferring a dedicated card
+  by name alone could send the model to a small one in preference to an
+  integrated processor with far more memory available.
+- Recognise a Vulkan graphics processor running out of memory, so Windows
+  falls back to the processor automatically. Only the macOS wording was
+  recognised before, leaving Windows with no automatic retry.
+- Record why the image model failed to start instead of discarding its
+  diagnostics, so running out of graphics memory is reported rather than
+  appearing as a model that never became ready.
+- Rank Intel's dedicated Arc cards above integrated graphics.
 - Restart ScanBox with a visible window after an update.
 - Take the macOS bundle version from the application source instead of a
   separate copy in the packaging file, which had let the bundle ship under the
