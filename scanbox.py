@@ -54,7 +54,7 @@ from fpdf import FPDF
 from PIL import Image, ImageGrab, ImageOps, UnidentifiedImageError
 
 APP_NAME = "ScanBox"
-APP_VERSION = "2026.9.3"
+APP_VERSION = "2026.9.4"
 UPDATE_MANIFEST_URL = os.environ.get(
     "SCANBOX_UPDATE_MANIFEST_URL",
     "https://api.github.com/repos/sjtaylor82/scanbox/releases/latest",
@@ -106,6 +106,42 @@ def _prepare_update_payload(archive_path, platform_name=None):
         os.makedirs(staging)
         bundle.extractall(staging)
     return os.path.join(staging, "ScanBox" if platform_name == "win32" else "ScanBox.app")
+
+
+def _prune_superseded_update_backups():
+    """Keep one rollback copy of the previous build and remove the rest.
+
+    Every portable update retains the application it replaced, which is around
+    300 MB on Windows. Retaining all of them would grow without limit, so keep
+    only the newest and discard abandoned staging folders.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    if sys.platform == "win32":
+        parent = Path(BASE)
+        backups = sorted(
+            parent.glob(".update-backup-*"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        stale = list(parent.glob(".update-new-*")) + backups[1:]
+    elif sys.platform == "darwin":
+        current_app = Path(sys.executable).resolve().parents[2]
+        backups = sorted(
+            current_app.parent.glob(current_app.name + ".previous-*"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        stale = backups[1:]
+    else:
+        return
+    for path in stale:
+        try:
+            shutil.rmtree(path, ignore_errors=False)
+            logger.info("Removed superseded update copy %s", path)
+        except Exception:
+            # A locked or partially removed copy is reclaimed on a later start.
+            logger.warning("Could not remove superseded update copy %s", path)
 
 
 def _launch_portable_updater(payload_path):
@@ -3833,6 +3869,13 @@ class ScanBox(wx.Frame):
                 name="ScanBox AI preload",
                 daemon=True,
             ).start()
+        # Reclaim the disk a previous update deliberately held on to. This is
+        # slow enough to keep off the UI thread and never blocks startup.
+        threading.Thread(
+            target=_prune_superseded_update_backups,
+            name="ScanBox update cleanup",
+            daemon=True,
+        ).start()
         if self.app_settings.get("check_for_updates_on_startup", True):
             # Wait until the frame is visible before a newer-release prompt
             # can appear. A startup check stays silent when current or offline.

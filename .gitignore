@@ -23,6 +23,8 @@ engines/florence2-runtime/
 # Build artifacts
 build/
 dist/
+# Release archives built or downloaded outside dist/.
+*.zip
 *.spec
 !packaging/ScanBox-macOS.spec
 !packaging/ScanBox-Windows.spec

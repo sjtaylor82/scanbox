@@ -143,6 +143,55 @@ class UpdateTests(unittest.TestCase):
                 if locked:
                     self.assertIn("Previous application restored", log.read_text(encoding="utf-8-sig"))
 
+    def test_prunes_superseded_backups_but_keeps_the_newest_and_user_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install = Path(directory)
+            (install / "ScanBox.exe").write_text("app")
+            (install / "_internal").mkdir()
+            for name in ("config", "engines", "images", "output"):
+                (install / name).mkdir()
+                (install / name / "keep.txt").write_text("user data")
+            backups = []
+            for index, token in enumerate(("aaa", "bbb", "ccc")):
+                backup = install / f".update-backup-{token}"
+                backup.mkdir()
+                (backup / "ScanBox.exe").write_text("previous")
+                os.utime(backup, (1000 + index * 100, 1000 + index * 100))
+                backups.append(backup)
+            staging = install / ".update-new-ddd"
+            staging.mkdir()
+
+            with (
+                mock.patch.object(scanbox.sys, "frozen", True, create=True),
+                mock.patch.object(scanbox.sys, "platform", "win32"),
+                mock.patch.object(scanbox, "BASE", str(install)),
+            ):
+                scanbox._prune_superseded_update_backups()
+
+            # Only the most recently written rollback copy survives.
+            self.assertTrue(backups[2].is_dir())
+            self.assertFalse(backups[0].exists())
+            self.assertFalse(backups[1].exists())
+            self.assertFalse(staging.exists())
+            self.assertTrue((install / "ScanBox.exe").is_file())
+            self.assertTrue((install / "_internal").is_dir())
+            for name in ("config", "engines", "images", "output"):
+                self.assertEqual((install / name / "keep.txt").read_text(), "user data")
+
+    def test_does_not_prune_from_a_source_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            install = Path(directory)
+            backup = install / ".update-backup-aaa"
+            backup.mkdir()
+
+            with (
+                mock.patch.object(scanbox.sys, "frozen", False, create=True),
+                mock.patch.object(scanbox, "BASE", str(install)),
+            ):
+                scanbox._prune_superseded_update_backups()
+
+            self.assertTrue(backup.is_dir())
+
     def test_selects_current_platform_release_asset(self):
         manifest = {
             "html_url": "https://github.com/example/releases/tag/v1",

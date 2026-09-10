@@ -34,6 +34,9 @@ version_info = VSVersionInfo(
             StringStruct("FileVersion", app_version),
             StringStruct("InternalName", app_name),
             StringStruct("OriginalFilename", "ScanBox.exe"),
+            # Deliberately nothing further. JAWS answers Ctrl+Insert+V from
+            # this resource, and every extra field it decides to read is more
+            # for the user to sit through before they hear the version.
         ])]),
         VarFileInfo([VarStruct("Translation", [0x0409, 1200])]),
     ],

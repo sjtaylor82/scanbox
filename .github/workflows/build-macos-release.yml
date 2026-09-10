@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Existing GitHub release tag to build and update
         required: true
-        default: v2026.9.1
+        default: v2026.9.4
 
 permissions:
   contents: write
@@ -25,6 +25,18 @@ jobs:
         with:
           ref: ${{ inputs.release_tag }}
 
+      - name: Verify the tag matches the source version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          SOURCE=$(python3 -c 'import ast, pathlib; print(next(ast.literal_eval(n.value) for n in ast.parse(pathlib.Path("scanbox.py").read_text(encoding="utf-8")).body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "APP_VERSION"))')
+          if [ "$SOURCE" != "$VERSION" ]; then
+            echo "APP_VERSION is $SOURCE but the release tag is $VERSION." >&2
+            exit 1
+          fi
+          echo "Building ScanBox $VERSION"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -41,6 +53,8 @@ jobs:
         run: python packaging/build_macos.py
 
       - name: Validate app bundle
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           APP="$HOME/Library/Caches/ScanBox/dist/ScanBox.app"
           test -x "$APP/Contents/MacOS/ScanBox"
@@ -51,6 +65,16 @@ jobs:
           test -f "$APP/Contents/Resources/config/vision_pack_qwen3_vl_2b.json"
           plutil -lint "$APP/Contents/Info.plist"
           codesign --verify --deep --strict "$APP"
+          # The bundle version is what macOS and its assistive technologies
+          # report, so it must match the release being published.
+          VERSION="${RELEASE_TAG#v}"
+          for KEY in CFBundleShortVersionString CFBundleVersion; do
+            FOUND=$(plutil -extract "$KEY" raw -o - "$APP/Contents/Info.plist")
+            if [ "$FOUND" != "$VERSION" ]; then
+              echo "Info.plist $KEY is $FOUND but the release is $VERSION." >&2
+              exit 1
+            fi
+          done
 
       - name: Package macOS release
         env:

@@ -1,11 +1,24 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import ast
 import os
 
 
 project = Path(SPECPATH).parent
 config_dir = project / "config"
+# Read the release version from the single source of truth, the same way the
+# Windows specification does. Repeating it here once let the macOS bundle ship
+# under the previous version number after a release bump.
+app_version = next(
+    ast.literal_eval(node.value)
+    for node in ast.parse((project / "scanbox.py").read_text(encoding="utf-8")).body
+    if isinstance(node, ast.Assign)
+    and any(
+        isinstance(target, ast.Name) and target.id == "APP_VERSION"
+        for target in node.targets
+    )
+)
 
 datas = [
     (str(project / "manual.html"), "."),
@@ -102,8 +115,8 @@ app = BUNDLE(
     bundle_identifier="au.com.scanbox.ScanBox",
     info_plist={
         "CFBundleDisplayName": "ScanBox",
-        "CFBundleShortVersionString": "2026.9.3",
-        "CFBundleVersion": "2026.9.3",
+        "CFBundleShortVersionString": app_version,
+        "CFBundleVersion": app_version,
         "LSApplicationCategoryType": "public.app-category.productivity",
         "NSCameraUsageDescription": (
             "ScanBox uses the selected camera to capture documents and "

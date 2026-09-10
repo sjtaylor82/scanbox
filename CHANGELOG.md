@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026.9.4
+
+- Refuse to finish a Windows build unless asking the active application for
+  its version announces exactly "ScanBox version <number>", and refuse to
+  build a macOS release whose version disagrees with the release tag.
+- Keep only the most recent retained copy of a replaced build. Earlier copies
+  and abandoned staging folders are removed at startup, instead of holding
+  roughly 300 MB per update indefinitely.
+- Restart ScanBox with a visible window after an update.
+- Take the macOS bundle version from the application source instead of a
+  separate copy in the packaging file, which had let the bundle ship under the
+  previous release's number.
+- macOS is rebuilt as 2026.9.4; its update mechanism is unchanged.
+
 ## 2026.9.3
 
 - Fixed the Windows portable updater aborting when ScanBox had already exited.

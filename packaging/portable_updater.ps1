@@ -51,6 +51,8 @@ try {
         $newItems.Add($name)
     }
     $success = $true
+    # The staging folder is empty once both items have been moved into place.
+    Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     Write-UpdateLog "Update completed. Previous application retained at $backup"
 } catch {
     $failure = $_.Exception.Message
@@ -75,7 +77,8 @@ try {
 } finally {
     if ($closed -and -not $NoRestart) {
         try {
-            Start-Process -FilePath (Join-Path $appRoot 'ScanBox.exe') -WorkingDirectory $appRoot -WindowStyle Hidden
+            # Never restart hidden: the window must come back for the user.
+            Start-Process -FilePath (Join-Path $appRoot 'ScanBox.exe') -WorkingDirectory $appRoot
             Write-UpdateLog 'ScanBox restart requested.'
         } catch {
             Write-UpdateLog "Restart failed: $($_.Exception.Message)"
