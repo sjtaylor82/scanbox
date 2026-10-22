@@ -395,8 +395,25 @@ DEFAULT_APP_SETTINGS = {
 }
 
 CAMERA_SETTLE_SECONDS = 1.5
+CAMERA_REPEAT_SETTLE_SECONDS = 0.3
 CAMERA_FRAME_TIMEOUT_SECONDS = 6.0
 CAMERA_READ_INTERVAL_SECONDS = 0.05
+
+
+def _configure_document_camera(camera):
+    """Request document detail without requiring optional camera controls."""
+    # shortcut: request the tested 8 MP mode; add mode selection after testing more cameras.
+    for prop, value in (
+        (cv2.CAP_PROP_FRAME_WIDTH, 3264),
+        (cv2.CAP_PROP_FRAME_HEIGHT, 2448),
+        (cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG")),
+        (cv2.CAP_PROP_AUTOFOCUS, 1),
+    ):
+        try:
+            accepted = camera.set(prop, value)
+            logger.info("Document camera property %s=%s accepted=%s", prop, value, accepted)
+        except Exception:
+            logger.debug("Camera rejected optional property %s", prop, exc_info=True)
 
 
 def _camera_frame_is_usable(frame):
@@ -418,6 +435,7 @@ def _read_settled_camera_frame(
     settle_seconds=CAMERA_SETTLE_SECONDS,
     timeout_seconds=CAMERA_FRAME_TIMEOUT_SECONDS,
     read_interval=CAMERA_READ_INTERVAL_SECONDS,
+    discard_first=False,
 ):
     """Read over elapsed time so slower DirectShow bridges can deliver a frame."""
     started = time.monotonic()
@@ -427,7 +445,7 @@ def _read_settled_camera_frame(
     while True:
         attempts += 1
         ok, candidate = camera.read()
-        if ok and _camera_frame_is_usable(candidate):
+        if ok and not (discard_first and attempts == 1) and _camera_frame_is_usable(candidate):
             latest = candidate
         now = time.monotonic()
         if latest is not None and now - started >= max(float(settle_seconds), 0.0):
@@ -3601,6 +3619,8 @@ class ScanBox(wx.Frame):
         self.camera_capture_interval = 5
         self.camera_capture_index = None
         self.camera_capture_device = None
+        self.camera_capture_device_index = None
+        self.camera_capture_warmed = False
         self.camera_capture_photo_mode = False
         self.camera_alignment_active = False
         self.camera_alignment_stop_event = None
@@ -5967,6 +5987,11 @@ class ScanBox(wx.Frame):
         backend = self.camera_backend()
         available = []
         for index in range(6):
+            retained = getattr(self, "camera_capture_device", None)
+            if (retained is not None and retained.isOpened()
+                    and index == getattr(self, "camera_capture_device_index", None)):
+                available.append(index)
+                continue
             candidate = cv2.VideoCapture(index, backend)
             try:
                 if candidate.isOpened():
@@ -6037,6 +6062,14 @@ class ScanBox(wx.Frame):
 
     def choose_camera(self, front_facing_only=False):
         """Return a camera index selected from the detected devices."""
+        retained = getattr(self, "camera_capture_device", None)
+        retained_index = getattr(self, "camera_capture_device_index", None)
+        if (not front_facing_only and retained is not None and retained.isOpened()
+                and self.app_settings.get("camera_index", -1) == retained_index
+                and self.app_settings.get("camera_name")
+                and self.camera_device_names().get(retained_index)
+                == self.app_settings["camera_name"]):
+            return retained_index
         if cv2 is None and sys.platform != "darwin":
             wx.MessageBox(
                 "Camera capture requires OpenCV. Install the full ScanBox "
@@ -6110,9 +6143,18 @@ class ScanBox(wx.Frame):
 
     def open_camera_capture_device(self, camera_index):
         """Open and retain a camera so bridge devices remain initialised."""
+        camera = getattr(self, "camera_capture_device", None)
+        if (camera is not None and camera.isOpened()
+                and getattr(self, "camera_capture_device_index", None) == camera_index):
+            logger.info("Reusing ready camera index %s", camera_index)
+            return camera
         self.close_camera_capture_device()
         camera = cv2.VideoCapture(camera_index, self.camera_backend())
         self.camera_capture_device = camera
+        self.camera_capture_device_index = camera_index
+        self.camera_capture_warmed = False
+        if camera.isOpened():
+            _configure_document_camera(camera)
         try:
             buffer_property = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
             if buffer_property is not None:
@@ -6129,6 +6171,8 @@ class ScanBox(wx.Frame):
     def close_camera_capture_device(self):
         camera = getattr(self, "camera_capture_device", None)
         self.camera_capture_device = None
+        self.camera_capture_device_index = None
+        self.camera_capture_warmed = False
         if camera is not None:
             try:
                 camera.release()
@@ -6184,6 +6228,8 @@ class ScanBox(wx.Frame):
         owns_camera = camera is None
         if owns_camera:
             camera = cv2.VideoCapture(camera_index, self.camera_backend())
+            if camera.isOpened():
+                _configure_document_camera(camera)
         try:
             if not camera.isOpened():
                 permission_help = (
@@ -6202,7 +6248,22 @@ class ScanBox(wx.Frame):
             # Read over real elapsed time. Freedom Scientific's PEARL
             # DirectShow bridge and some document cameras need time to start;
             # rapid fixed-count reads can save a blank startup image.
-            frame, attempts = _read_settled_camera_frame(camera)
+            warmed = not owns_camera and getattr(self, "camera_capture_warmed", False)
+            # DirectShow holds an unread frame between captures; do not OCR that queued image.
+            frame, attempts = _read_settled_camera_frame(
+                camera,
+                settle_seconds=CAMERA_REPEAT_SETTLE_SECONDS if warmed else CAMERA_SETTLE_SECONDS,
+                discard_first=warmed,
+            )
+            if frame is None:
+                logger.warning("Document camera mode returned no image; retrying defaults")
+                camera.release()
+                camera = cv2.VideoCapture(camera_index, self.camera_backend())
+                if not owns_camera:
+                    self.camera_capture_device = camera
+                    self.camera_capture_warmed = False
+                if camera.isOpened():
+                    frame, attempts = _read_settled_camera_frame(camera)
             logger.info(
                 "Camera index %s capture completed after %s reads; frame=%s",
                 camera_index,
@@ -6217,6 +6278,8 @@ class ScanBox(wx.Frame):
                 )
                 return None
 
+            if not owns_camera:
+                self.camera_capture_warmed = True
             path = os.path.join(TEMP_DIR, f"camera_{uuid.uuid4().hex}.png")
             if not cv2.imwrite(path, frame):
                 raise OSError("The captured camera image could not be saved.")
@@ -6474,6 +6537,7 @@ class ScanBox(wx.Frame):
         wx.CallAfter(self.scan_save_images_btn.SetFocus)
 
     def on_camera_capture(self, event, is_photo_mode):
+        logger.info("Camera capture requested")
         if self.photo_mode_blocked(is_photo_mode):
             return
         delay = max(
@@ -6534,6 +6598,7 @@ class ScanBox(wx.Frame):
             return
         path = self.capture_camera_page(self.camera_capture_index)
         if not path:
+            self.close_camera_capture_device()
             self.complete_camera_workflow()
             return
         self.process_image(
@@ -6571,7 +6636,8 @@ class ScanBox(wx.Frame):
 
     def complete_camera_workflow(self):
         self.camera_capture_timer.Stop()
-        self.close_camera_capture_device()
+        if self.camera_capture_stopping or self.app_settings.get("camera_index", -1) == -1:
+            self.close_camera_capture_device()
         self.camera_capture_active = False
         self.camera_capture_stopping = False
         self.camera_capture_index = None
@@ -6590,6 +6656,7 @@ class ScanBox(wx.Frame):
 
     def start_camera_alignment(self, event=None):
         """Guide a user until one face is centred in a front-facing camera."""
+        self.close_camera_capture_device()
         launch_focus = wx.Window.FindFocus()
         camera_index = self.choose_camera(front_facing_only=True)
         if camera_index is None:
@@ -8450,6 +8517,11 @@ class ScanBox(wx.Frame):
                     camera_options[camera_selection - 1]
                     if 0 < camera_selection <= len(camera_options) else None
                 )
+                if (self.app_settings.get("camera_index", -1)
+                        != (selected_camera["index"] if selected_camera else -1)
+                        or self.app_settings.get("camera_name", "")
+                        != (selected_camera["name"] if selected_camera else "Ask me each time")):
+                    self.close_camera_capture_device()
                 self.app_settings["camera_index"] = (
                     selected_camera["index"] if selected_camera else -1
                 )

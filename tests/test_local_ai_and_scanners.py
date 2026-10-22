@@ -328,6 +328,121 @@ class ScannerSelectionTests(unittest.TestCase):
 
 
 class CameraCaptureTests(unittest.TestCase):
+    def test_repeat_reader_discards_stale_frame_and_rejects_blank_frames(self):
+        blank = np.zeros((10, 10, 3), dtype=np.uint8)
+        stale, fresh = blank.copy(), blank.copy()
+        stale[1:3] = 100
+        fresh[5:8] = 180
+        camera = mock.Mock()
+        camera.read.side_effect = [(True, stale), (True, blank), (True, fresh)]
+        frame, attempts = scanbox._read_settled_camera_frame(
+            camera, settle_seconds=0, read_interval=0, discard_first=True,
+        )
+        self.assertIs(frame, fresh)
+        self.assertEqual(attempts, 3)
+
+    def test_only_successful_retained_capture_uses_short_wait_next_time(self):
+        camera = mock.Mock()
+        frame = SimpleNamespace(camera_capture_device=camera, camera_capture_warmed=False)
+        page = np.zeros((10, 10, 3), dtype=np.uint8)
+        with mock.patch.object(scanbox, "_read_settled_camera_frame", return_value=(page, 3)) as read, \
+             mock.patch.object(scanbox.cv2, "imwrite", return_value=True), \
+             mock.patch.object(scanbox, "play_shutter_sound"):
+            scanbox.ScanBox.capture_camera_page(frame, 0)
+            read.assert_called_with(camera, settle_seconds=1.5, discard_first=False)
+            scanbox.ScanBox.capture_camera_page(frame, 0)
+            read.assert_called_with(camera, settle_seconds=.3, discard_first=True)
+        scanbox.ScanBox.close_camera_capture_device(frame)
+        self.assertFalse(frame.camera_capture_warmed)
+
+    def test_ready_saved_camera_skips_probing(self):
+        camera = mock.Mock()
+        frame = SimpleNamespace(
+            camera_capture_device=camera, camera_capture_device_index=0,
+            app_settings={"camera_index": 0, "camera_name": "IPEVO V4K"},
+            camera_device_names=mock.Mock(return_value={0: "IPEVO V4K"}),
+            available_camera_indexes=mock.Mock(),
+        )
+        self.assertEqual(scanbox.ScanBox.choose_camera(frame), 0)
+        frame.available_camera_indexes.assert_not_called()
+
+    def test_ready_camera_is_reused_but_switching_releases_it(self):
+        camera = mock.Mock()
+        frame = SimpleNamespace(
+            camera_capture_device=camera, camera_capture_device_index=0,
+            camera_backend=lambda: scanbox.cv2.CAP_DSHOW,
+        )
+        frame.close_camera_capture_device = lambda: scanbox.ScanBox.close_camera_capture_device(frame)
+        with mock.patch.object(scanbox.cv2, "VideoCapture") as open_camera, \
+             mock.patch.object(scanbox, "_configure_document_camera") as configure:
+            self.assertIs(scanbox.ScanBox.open_camera_capture_device(frame, 0), camera)
+            open_camera.assert_not_called()
+            configure.assert_not_called()
+            scanbox.ScanBox.open_camera_capture_device(frame, 1)
+            camera.release.assert_called_once()
+            open_camera.assert_called_once_with(1, scanbox.cv2.CAP_DSHOW)
+            self.assertEqual(frame.camera_capture_device_index, 1)
+
+    def test_completed_capture_keeps_saved_camera_but_releases_ask_each_time(self):
+        camera = mock.Mock()
+        frame = SimpleNamespace(
+            camera_capture_device=camera, camera_capture_device_index=0,
+            camera_capture_timer=mock.Mock(), camera_capture_stopping=False,
+            camera_capture_active=True, camera_alignment_active=False,
+            app_settings={"camera_index": 0},
+            update_controls=mock.Mock(),
+        )
+        frame.close_camera_capture_device = lambda: scanbox.ScanBox.close_camera_capture_device(frame)
+        scanbox.ScanBox.complete_camera_workflow(frame)
+        camera.release.assert_not_called()
+        self.assertFalse(frame.camera_capture_active)
+        frame.app_settings["camera_index"] = -1
+        scanbox.ScanBox.complete_camera_workflow(frame)
+        camera.release.assert_called_once()
+        self.assertIsNone(frame.camera_capture_device_index)
+
+    def test_document_mode_sets_mjpeg_after_dimensions(self):
+        camera = mock.Mock()
+        scanbox._configure_document_camera(camera)
+        self.assertEqual(camera.set.call_args_list, [
+            mock.call(scanbox.cv2.CAP_PROP_FRAME_WIDTH, 3264),
+            mock.call(scanbox.cv2.CAP_PROP_FRAME_HEIGHT, 2448),
+            mock.call(scanbox.cv2.CAP_PROP_FOURCC, scanbox.cv2.VideoWriter_fourcc(*"MJPG")),
+            mock.call(scanbox.cv2.CAP_PROP_AUTOFOCUS, 1),
+        ])
+
+    def test_document_mode_tolerates_unsupported_controls(self):
+        camera = mock.Mock()
+        camera.set.side_effect = [False, RuntimeError("unsupported"), False, False]
+        scanbox._configure_document_camera(camera)
+        self.assertEqual(camera.set.call_count, 4)
+
+    def test_failed_document_mode_reopens_defaults_and_keeps_ownership(self):
+        for retained in (False, True):
+            with self.subTest(retained=retained):
+                original, fallback = mock.Mock(), mock.Mock()
+                page = np.zeros((10, 10, 3), dtype=np.uint8)
+                page[2:8, 2:8] = 180
+                frame = SimpleNamespace(
+                    camera_capture_device=original if retained else None,
+                    camera_backend=lambda: scanbox.cv2.CAP_DSHOW,
+                )
+                opened = [fallback] if retained else [original, fallback]
+                with mock.patch.object(scanbox.cv2, "VideoCapture", side_effect=opened), \
+                     mock.patch.object(scanbox, "_configure_document_camera") as configure, \
+                     mock.patch.object(scanbox, "_read_settled_camera_frame", side_effect=[(None, 4), (page, 2)]), \
+                     mock.patch.object(scanbox.cv2, "imwrite", return_value=True), \
+                     mock.patch.object(scanbox, "play_shutter_sound"):
+                    path = scanbox.ScanBox.capture_camera_page(frame, 0)
+                self.assertIsNotNone(path)
+                original.release.assert_called_once()
+                self.assertEqual(configure.call_count, 0 if retained else 1)
+                if retained:
+                    self.assertIs(frame.camera_capture_device, fallback)
+                    fallback.release.assert_not_called()
+                else:
+                    fallback.release.assert_called_once()
+
     def test_saved_camera_is_used_without_prompting(self):
         frame = SimpleNamespace(app_settings={"camera_index": 2})
         frame.available_camera_indexes = mock.Mock(return_value=[0, 2])
