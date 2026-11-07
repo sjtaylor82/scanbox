@@ -103,6 +103,7 @@ class LocalAiDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(result, "Recognised text")
         self.assertEqual(captured["url"], "http://127.0.0.1:8000/v1/chat/completions")
+        self.assertEqual(captured["payload"]["max_tokens"], 8192)
         content = captured["payload"]["messages"][0]["content"]
         self.assertEqual(content[1]["type"], "image_url")
 
@@ -133,6 +134,7 @@ class LocalAiDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(result, "A detailed description")
         self.assertEqual(captured["url"], "http://127.0.0.1:11434/api/chat")
+        self.assertEqual(captured["payload"]["options"]["num_predict"], 8192)
         encoded = captured["payload"]["messages"][0]["images"][0]
         with scanbox.Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
             self.assertEqual(image.format, "PNG")
@@ -210,6 +212,23 @@ class ExternalAiRegressionTests(unittest.TestCase):
                             for request in requests))
         self.assertEqual(found[0]["model"], "deepseek-ocr")
 
+    def test_reasoning_model_question_gets_minimum_visible_answer_budget(self):
+        captured = {}
+        response = JsonResponse(json.dumps({
+            "choices": [{"finish_reason": "stop", "message": {"content": "Answer"}}]
+        }).encode())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "screen.png"
+            scanbox.Image.new("RGB", (10, 10)).save(path)
+            with mock.patch.object(
+                scanbox.urllib.request, "urlopen", return_value=response
+            ) as urlopen:
+                scanbox.run_external_ai_task(
+                    "question", path, "Question", 384, settings=self.settings
+                )
+        captured = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(captured["max_tokens"], 8192)
+
     def test_screen_ocr_prefers_selected_provider_and_falls_back_on_failure(self):
         for answer, expected in (("A complete external screen transcription", "A complete external screen transcription"),
                                  ("Local AI service returned incomplete text", "One two three four five six")):
@@ -241,6 +260,10 @@ class ExternalAiRegressionTests(unittest.TestCase):
         )
         dialog = mock.Mock()
         dialog.ShowModal.return_value = scanbox.wx.ID_OK
+        # A real window handle, not a mock. The question dialog is pulled to
+        # the foreground through this handle, and a mock reaching ctypes
+        # crashes the interpreter rather than failing the test.
+        dialog.GetHandle.return_value = 12345
         question = mock.Mock()
         question.GetValue.return_value = "What is shown?"
         worker = mock.Mock()
@@ -253,11 +276,16 @@ class ExternalAiRegressionTests(unittest.TestCase):
             mock.patch.object(scanbox.threading, "Thread", return_value=worker),
             mock.patch.object(scanbox, "play_shutter_sound"),
             mock.patch.object(scanbox, "_find_mtmd_model_files", return_value=None),
+            mock.patch.object(scanbox, "bring_window_to_front") as to_front,
         ):
             scanbox.ScanBox._ask_screen_question(frame, "screen.png")
 
         frame._begin_screen_processing.assert_called_once_with()
         worker.start.assert_called_once_with()
+        # The question needs the foreground, or it is typed into whatever
+        # window was in front instead.
+        to_front.assert_called_once_with(12345)
+        question.SetFocus.assert_called_once_with()
 
 
 class ScannerSelectionTests(unittest.TestCase):

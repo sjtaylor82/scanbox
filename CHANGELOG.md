@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Give every external local-AI task an 8,192-token output ceiling so reasoning
+  models such as Gemma have room for a visible answer.
+
 ## 2026.9.6
 
 - Make portable Windows updates easier to follow with an accessible download

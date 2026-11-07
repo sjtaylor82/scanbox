@@ -838,6 +838,12 @@ LOCAL_AI_SERVICES = (
     },
 )
 
+EXTERNAL_AI_MAX_TOKENS = {
+    "transcribe": 8192,
+    "describe": 8192,
+    "question": 8192,
+}
+
 
 def _normalise_local_ai_url(url):
     """Validate a local/private AI service URL and remove trailing slashes."""
@@ -1006,8 +1012,11 @@ def run_external_ai_task(
     if cancel_event is not None and cancel_event.is_set():
         return PHOTO_DESCRIPTION_CANCELLED
     try:
-        if max_tokens is None:
-            max_tokens = 8192 if task == "transcribe" else 512
+        recommended_tokens = EXTERNAL_AI_MAX_TOKENS.get(task, 2048)
+        # The caller may pass the smaller limit tuned for ScanBox's built-in
+        # model. External reasoning models need enough completion budget for
+        # both hidden reasoning and their visible answer.
+        max_tokens = max(int(max_tokens or 0), recommended_tokens)
         # Scanner TIFFs and imported images must use a format the services
         # support. Encode the actual pixels, without modifying the source.
         with Image.open(image_path) as source, io.BytesIO() as image_file:
@@ -2757,7 +2766,7 @@ def run_vision_task(
             task,
             image_path,
             prompt_override,
-            max_tokens if max_tokens is not None else (384 if task == "question" else None),
+            max_tokens,
             cancel_event,
             settings,
         )
