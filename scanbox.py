@@ -8053,9 +8053,9 @@ class ScanBox(wx.Frame):
                 + "\n\n"
             ) + text, 0
         return (
-            f"This page was scanned {orientation}, which is why it first came "
-            f"out as nonsense. ScanBox turned it {rotation} degrees and read "
-            "it again. The corrected reading follows."
+            f"This page was scanned {orientation}. ScanBox turned it "
+            f"{rotation} degrees and read it again. The corrected reading "
+            "follows."
             + "\n\n"
         ) + upright_text, rotation
 
