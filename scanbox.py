@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import shlex
@@ -596,19 +597,93 @@ def _make_speaker():
         return lambda text: None
 
 
-def announce(text):
-    """Announce text through the active screen reader.
-    Best-effort, never raises, and silent when no screen reader is running."""
+# Screen readers speak whatever arrives last. Two announcements sent close
+# together therefore lose the first one: NVDA/JAWS drop the message in
+# progress and start the new one. That is how a result got reported as
+# clipped - the status message and the result collided. Announcements are
+# queued here and paced apart by an estimate of how long each takes to
+# speak, so a message is allowed to finish before the next one is sent.
+#
+# The estimate is deliberately on the quick side. Experienced screen-reader
+# users run high speech rates, and waiting longer than the speech actually
+# takes would make ScanBox feel sluggish. Pacing cannot stop the screen
+# reader itself interrupting us (a focus change speaks immediately, and we
+# do not control that), so anything a user needs to be able to re-read is
+# also written to the Results area rather than only spoken.
+_SPEECH_WORDS_PER_MINUTE = 300
+_SPEECH_MINIMUM_GAP = 0.4
+_SPEECH_MAXIMUM_GAP = 10.0
+
+_speech_queue = queue.Queue()
+_speech_thread = None
+_speech_thread_lock = threading.Lock()
+_speech_generation = 0
+
+
+def _speech_gap_seconds(text):
+    """Estimate how long a screen reader needs to speak ``text``."""
+    words = len(re.findall(r"\S+", text))
+    seconds = words * 60.0 / _SPEECH_WORDS_PER_MINUTE
+    return max(_SPEECH_MINIMUM_GAP, min(seconds, _SPEECH_MAXIMUM_GAP))
+
+
+def _speak_now(text):
+    """Send one message straight to the screen reader."""
     global _win_speaker
-    text = text or ""
-    if not text:
-        return
     try:
         if _win_speaker is None:
             _win_speaker = _make_speaker()
         _win_speaker(text)
     except Exception:
-        pass
+        logger.exception("Could not announce through the screen reader")
+
+
+def _speech_worker():
+    while True:
+        generation, text = _speech_queue.get()
+        # A message queued before replace_pending() was called is stale. Live
+        # guidance (FaceAlign positions) must never read out a position the
+        # user has already moved away from.
+        if generation != _speech_generation:
+            continue
+        _speak_now(text)
+        time.sleep(_speech_gap_seconds(text))
+
+
+def _ensure_speech_thread():
+    global _speech_thread
+    with _speech_thread_lock:
+        if _speech_thread is None or not _speech_thread.is_alive():
+            _speech_thread = threading.Thread(
+                target=_speech_worker,
+                name="ScanBox speech",
+                daemon=True,
+            )
+            _speech_thread.start()
+
+
+def announce(text, replace_pending=False):
+    """Announce text through the active screen reader.
+
+    Messages are queued and spaced out so that one announcement does not cut
+    off the one before it. Best-effort, never raises, and silent when no
+    screen reader is running.
+
+    Pass ``replace_pending=True`` for live guidance that is only true right
+    now, such as a camera position. Any queued message that has not been
+    spoken yet is dropped and this one is spoken immediately, because a
+    stale position is worse than a missed one.
+    """
+    global _speech_generation
+    text = text or ""
+    if not text:
+        return
+    if replace_pending:
+        _speech_generation += 1
+        _speak_now(text)
+        return
+    _ensure_speech_thread()
+    _speech_queue.put((_speech_generation, text))
 
 
 def play_shutter_sound():
@@ -623,6 +698,24 @@ def play_shutter_sound():
             _shutter_sound.Play(wx.adv.SOUND_ASYNC)
     except Exception:
         logger.exception("Could not play shutter sound")
+
+
+def bring_window_to_front(handle):
+    """Pull a native window to the foreground. Best-effort, never raises.
+
+    The handle is turned into a plain integer before it reaches ctypes. Handed
+    an object rather than a number, ctypes looks for ``_as_parameter_`` on it
+    and converts that instead - and on anything that answers every attribute
+    lookup with another such object, that chase never ends. It overflows the C
+    stack, which crashes the process outright and which no ``except`` can
+    catch. Coercing first turns that into an ordinary, catchable TypeError.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.user32.SetForegroundWindow(int(handle))
+    except Exception:
+        logger.debug("Could not bring window %r to the foreground", handle)
 
 
 def grab_foreground_window():
@@ -2593,6 +2686,143 @@ def _orientation_transcript_score(text):
     return common * 30 + plausible * 3 + len(text) * 0.02 - strange * 8
 
 
+# Measured against real scans: pages read upside down score about 0.9 to
+# 1.2 per word, while pages read the right way up score from 6.4 (a dense
+# form, which is short on ordinary English words) to 17 (plain prose). The
+# gap is wide, so 3.0 separates them without straying near either side.
+_MISREAD_SCORE_PER_WORD = 3.0
+_MISREAD_MINIMUM_WORDS = 12
+
+_ROTATION_TRANSPOSES = {
+    90: Image.Transpose.ROTATE_270,
+    180: Image.Transpose.ROTATE_180,
+    270: Image.Transpose.ROTATE_90,
+}
+
+
+def document_text_score_per_word(text):
+    """Score how much a transcript reads like real text, per recognised word."""
+    words = re.findall(r"[A-Za-z]+(?:['’-][A-Za-z]+)?", text)
+    if not words:
+        return 0.0, 0
+    return _orientation_transcript_score(text) / len(words), len(words)
+
+
+def looks_like_misread_document(text):
+    """Is this transcript bad enough to be worth testing other orientations?
+
+    True either when the text reads like noise rather than language, or when
+    barely any text came back at all - a page fed in upside down or sideways
+    often produces both.
+    """
+    score, word_count = document_text_score_per_word(text or "")
+    if word_count < _MISREAD_MINIMUM_WORDS:
+        return True
+    return score < _MISREAD_SCORE_PER_WORD
+
+
+# A word whose box comes within this fraction of a border was cut by the edge
+# of the scan rather than ending there. Two are required before saying so: a
+# single word sitting hard against a margin happens on legitimate layouts.
+_CLIPPED_EDGE_TOLERANCE = 0.004
+_CLIPPED_EDGE_MINIMUM_WORDS = 2
+_EDGE_NAMES = ("left", "right", "top", "bottom")
+
+
+def detect_clipped_edges(image_path, rotation=0):
+    """Return the edges of a page where recognised words run off the scan.
+
+    This asks where the OCR engine found words, not where there is ink. A
+    form's own full-bleed header bar reaches the paper edge by design and
+    would defeat any ink-at-the-border test, but no words are recognised
+    inside it, so it is ignored here for free.
+
+    ``rotation`` is the clockwise turn already applied to make the page
+    upright, so that the edges are named as the reader sees them rather than
+    as the page happened to go through the scanner.
+    """
+    rotated_path = None
+    try:
+        if rotation % 360:
+            rotated_path = rotate_image_clockwise(image_path, rotation)
+        measured = windows_ocr_word_boxes(rotated_path or image_path)
+    except Exception:
+        logger.exception("Edge check failed for %s", image_path)
+        return []
+    finally:
+        if rotated_path:
+            _remove_quietly(rotated_path)
+    if not measured:
+        return []
+    width, height, words = measured
+    if not width or not height or not words:
+        return []
+
+    horizontal = width * _CLIPPED_EDGE_TOLERANCE
+    vertical = height * _CLIPPED_EDGE_TOLERANCE
+    touching = {name: [] for name in _EDGE_NAMES}
+    for text, left, top, word_width, word_height in words:
+        if not (text or "").strip():
+            continue
+        if left <= horizontal:
+            touching["left"].append(text)
+        if left + word_width >= width - horizontal:
+            touching["right"].append(text)
+        if top <= vertical:
+            touching["top"].append(text)
+        if top + word_height >= height - vertical:
+            touching["bottom"].append(text)
+
+    clipped = [
+        name for name in _EDGE_NAMES
+        if len(touching[name]) >= _CLIPPED_EDGE_MINIMUM_WORDS
+    ]
+    if clipped:
+        logger.info(
+            "Clipped edges for %s: %s",
+            image_path,
+            {name: touching[name][:5] for name in clipped},
+        )
+    return clipped
+
+
+def describe_edge_list(edges):
+    """Render edge names as "the right edge" or "the top and right edges"."""
+    if not edges:
+        return ""
+    if len(edges) == 1:
+        return f"the {edges[0]} edge"
+    return "the " + ", ".join(edges[:-1]) + f" and {edges[-1]} edges"
+
+
+# What process_document returns when it got no usable text at all. These read
+# as perfectly good English, so they have to be recognised by name rather than
+# scored, or they would be mistaken for a successful reading.
+_UNREADABLE_NOTICES = (
+    "This document could not be read reliably",
+    "The local AI pack is being installed",
+)
+
+
+def is_unreadable_notice(text):
+    """Is this ScanBox saying it failed, rather than a reading of the page?"""
+    return (text or "").lstrip().startswith(_UNREADABLE_NOTICES)
+
+
+def rotate_image_clockwise(image_path, degrees):
+    """Write a copy of an image turned ``degrees`` clockwise. Returns its path."""
+    transpose = _ROTATION_TRANSPOSES.get(degrees % 360)
+    rotated_path = os.path.join(
+        TEMP_DIR, f"upright_{uuid.uuid4().hex}{os.path.splitext(image_path)[1] or '.png'}"
+    )
+    with Image.open(image_path) as opened:
+        image = ImageOps.exif_transpose(opened)
+        if transpose is not None:
+            image = image.transpose(transpose)
+        image.save(rotated_path)
+    return rotated_path
+
+
 def detect_document_rotation(image_path):
     """Return a strongly supported clockwise text rotation, or None."""
     if sys.platform == "darwin":
@@ -3201,6 +3431,47 @@ def windows_ocr(path):
     finally:
         if prepared_path != path:
             _remove_quietly(prepared_path)
+
+
+def windows_ocr_word_boxes(path):
+    """Return (width, height, words) for one image, or None if unavailable.
+
+    Each word is (text, x, y, width, height) in the pixels of the bitmap whose
+    size is returned alongside, so callers can work in fractions of the page.
+    """
+    if sys.platform != "win32":
+        return None
+
+    async def recognise():
+        from winsdk.windows.graphics.imaging import BitmapDecoder
+        from winsdk.windows.media.ocr import OcrEngine
+        from winsdk.windows.storage import FileAccessMode, StorageFile
+
+        source = await StorageFile.get_file_from_path_async(os.path.abspath(path))
+        stream = await source.open_async(FileAccessMode.READ)
+        try:
+            decoder = await BitmapDecoder.create_async(stream)
+            bitmap = await decoder.get_software_bitmap_async()
+            engine = OcrEngine.try_create_from_user_profile_languages()
+            if engine is None:
+                return None
+            result = await engine.recognize_async(bitmap)
+            words = []
+            for line in result.lines:
+                for word in line.words:
+                    rect = word.bounding_rect
+                    words.append(
+                        (word.text, rect.x, rect.y, rect.width, rect.height)
+                    )
+            return bitmap.pixel_width, bitmap.pixel_height, words
+        finally:
+            stream.close()
+
+    try:
+        return asyncio.run(recognise())
+    except Exception:
+        logger.exception("Windows OCR word boxes failed for %s", path)
+        return None
 
 
 def macos_ocr(path):
@@ -4495,10 +4766,7 @@ class ScanBox(wx.Frame):
         if self.IsIconized():
             self.Iconize(False)
         self.Raise()
-        try:
-            ctypes.windll.user32.SetForegroundWindow(self.GetHandle())
-        except Exception:
-            pass
+        bring_window_to_front(self.GetHandle())
         focus = self._restore_focus
         if focus is not None:
             try:
@@ -4604,10 +4872,7 @@ class ScanBox(wx.Frame):
 
     def _restore_after_screen_question(self, restore_window=None, restore_app=""):
         if sys.platform == "win32" and restore_window:
-            try:
-                ctypes.windll.user32.SetForegroundWindow(restore_window)
-            except Exception:
-                pass
+            bring_window_to_front(restore_window)
         elif sys.platform == "darwin" and restore_app:
             try:
                 subprocess.Popen(
@@ -4689,11 +4954,7 @@ class ScanBox(wx.Frame):
         )
         def focus_question_dialog():
             dialog.Raise()
-            if sys.platform == "win32":
-                try:
-                    ctypes.windll.user32.SetForegroundWindow(dialog.GetHandle())
-                except Exception:
-                    pass
+            bring_window_to_front(dialog.GetHandle())
             question.SetFocus()
 
         wx.CallAfter(focus_question_dialog)
@@ -5220,7 +5481,7 @@ class ScanBox(wx.Frame):
             started = time.perf_counter()
             if external_ai_config(self.app_settings) is not None:
                 text = run_external_ai_task(
-                    "question", path, prompt, 384, self.shutdown_event,
+                    "question", path, prompt, EXTERNAL_AI_MAX_TOKENS["question"], self.shutdown_event,
                     self.app_settings,
                 )
                 model_label = self.app_settings.get("external_ai_model", "Local AI")
@@ -5312,7 +5573,7 @@ class ScanBox(wx.Frame):
         try:
             if external_ai_config(self.app_settings) is not None:
                 answer = run_external_ai_task(
-                    "question", path, prompt, 384, cancel_event,
+                    "question", path, prompt, EXTERNAL_AI_MAX_TOKENS["question"], cancel_event,
                     self.app_settings,
                 )
                 model_label = self.app_settings.get("external_ai_model", "Local AI")
@@ -6302,7 +6563,7 @@ class ScanBox(wx.Frame):
                 self._finish_image_export()
             return
         self.image_export_paths.append(path)
-        self.begin_busy("ScanBox is checking the page orientation.")
+        self.begin_busy("ScanBox is checking the page orientation and edges.")
         threading.Thread(
             target=self._image_export_orientation_worker,
             args=(path,),
@@ -6321,20 +6582,47 @@ class ScanBox(wx.Frame):
         except Exception:
             logger.exception("Image export orientation failed for %s", path)
             rotation = None
-        wx.CallAfter(self._finish_image_export_orientation, path, rotation)
+        # Named for the page as it will be saved, which is upright if the
+        # rotation below is accepted.
+        edges = detect_clipped_edges(path, rotation or 0)
+        wx.CallAfter(
+            self._finish_image_export_orientation, path, rotation, edges
+        )
 
-    def _finish_image_export_orientation(self, path, rotation):
+    def _finish_image_export_orientation(self, path, rotation, edges=()):
         self.end_busy()
         page_number = self.image_export_paths.index(path) + 1
         correction = self._confirm_image_export_rotation(page_number, rotation)
         if correction is None:
             self._finish_image_export()
             return
+        # The edges were named for the upright page. If the user kept the
+        # page as scanned instead, saying "the right edge" would point at the
+        # wrong side, so say nothing rather than something misleading.
+        if edges and correction == (rotation or 0):
+            self._warn_about_clipped_export(page_number, edges)
         self.image_export_rotations[path] = correction
         if self.image_export_multiple:
             self._prompt_for_another_export_page()
         else:
             self._save_single_page_image()
+
+    def _warn_about_clipped_export(self, page_number, edges):
+        """Say that part of the page fell outside the scan before saving it.
+
+        The saved image looks like a complete page to anyone who cannot see
+        that a margin is missing, so this has to be said out loud rather than
+        left for the reader to notice.
+        """
+        wx.MessageBox(
+            f"Part of page {page_number} was cut off at "
+            f"{describe_edge_list(edges)}, so some words are missing from the "
+            "image. Move the page further onto the scanner and scan it again "
+            "if you need the whole page.",
+            "Part of the page was cut off",
+            wx.OK | wx.ICON_WARNING,
+            self,
+        )
 
     def _confirm_image_export_rotation(self, page_number, rotation):
         if rotation is None:
@@ -6821,7 +7109,7 @@ class ScanBox(wx.Frame):
             if self.facealign_status is not None:
                 self.facealign_status.SetLabel(message)
                 self.facealign_dialog.Layout()
-            announce(message)
+            announce(message, replace_pending=True)
 
     def _finish_camera_alignment(self, error, stop_event):
         if stop_event is not self.camera_alignment_stop_event:
@@ -7584,6 +7872,11 @@ class ScanBox(wx.Frame):
         except Exception as exc:
             logger.exception("Image processing failed for %s", path)
             text = f"Processing failed: {exc}"
+        if not is_photo_mode and not text.startswith("Processing failed:"):
+            text, rotation = self._read_upright_if_misread(path, text, page_number)
+            text = self._warn_about_clipped_edges(
+                path, rotation, page_number
+            ) + text
         logger.info(
             "Processed image page=%s photo_mode=%s path=%s\nresult:\n%s",
             page_number,
@@ -7649,6 +7942,122 @@ class ScanBox(wx.Frame):
         self.update_controls()
         if completion is not None:
             wx.CallAfter(completion, text)
+
+    def _warn_about_clipped_edges(self, path, rotation, page_number):
+        """Say so when part of the page fell outside the scan.
+
+        Unlike a page read upside down, a clipped page produces text that
+        reads perfectly well - it just has words missing out of it, with
+        nothing to mark where. That is invisible in the result, so it has to
+        be stated. The notice goes into the text as well as being spoken, so
+        it is still there to read back.
+        """
+        try:
+            edges = detect_clipped_edges(path, rotation)
+        except Exception:
+            logger.exception("Edge check failed for page %s", page_number)
+            return ""
+        if not edges:
+            return ""
+        return (
+            f"Part of this page was cut off at {describe_edge_list(edges)}, so "
+            "some words are missing from the reading below. Move the page "
+            "further onto the scanner and scan it again.\n\n"
+        )
+
+    def _read_upright_if_misread(self, path, text, page_number):
+        """Re-read a page that OCR turned into nonsense, in case it went in rotated.
+
+        A page fed in upside down or sideways still produces a transcript -
+        just a meaningless one. There is no way for a user who cannot see the
+        page to tell that apart from a genuinely unreadable document, so when
+        the transcript reads like noise ScanBox tests the other orientations
+        before handing it over, and says what it found.
+
+        Returns the text to display and the clockwise rotation that produced
+        it, so the caller can describe the page the way the reader now has it.
+        Any explanation is part of that text and is not only spoken, so it can
+        still be read back afterwards.
+        """
+        if not looks_like_misread_document(text):
+            return text, 0
+        score, word_count = document_text_score_per_word(text)
+        logger.info(
+            "Page %s transcript looks misread (score/word=%.2f words=%s); "
+            "testing other orientations",
+            page_number,
+            score,
+            word_count,
+        )
+        wx.CallAfter(
+            self.SetStatusText,
+            "Please wait. Checking whether the page was scanned upright.",
+        )
+        try:
+            rotation = detect_document_rotation(path)
+        except Exception:
+            logger.exception("Orientation check failed for %s", path)
+            return text, 0
+        if rotation is None:
+            return (
+                "ScanBox could not read this page clearly, and could not tell "
+                "whether it was scanned upright. If the reading below looks "
+                "wrong, try scanning the page again the other way up."
+                + "\n\n"
+            ) + text, 0
+        if rotation == 0:
+            return (
+                "ScanBox could not read this page clearly. The page was "
+                "scanned upright, so turning it around will not help."
+                + "\n\n"
+            ) + text, 0
+
+        rotated_path = None
+        try:
+            rotated_path = rotate_image_clockwise(path, rotation)
+            upright_text = self.process_document(
+                rotated_path,
+                allow_install_prompt=False,
+                detect_page=False,
+                page_number=page_number,
+            )
+        except Exception:
+            logger.exception("Could not re-read %s turned upright", path)
+            return text, 0
+        finally:
+            if rotated_path:
+                _remove_quietly(rotated_path)
+
+        upright_score, _ = document_text_score_per_word(upright_text)
+        orientation = "upside down" if rotation == 180 else "on its side"
+        logger.info(
+            "Page %s re-read turned %s degrees clockwise: score/word %.2f -> %.2f",
+            page_number,
+            rotation,
+            score,
+            upright_score,
+        )
+        # ScanBox's own "could not be read" messages are fluent English and so
+        # score highly. Without this guard, a page that read as nothing either
+        # way round would come back as a confident "corrected reading" that is
+        # really just the failure message.
+        if is_unreadable_notice(upright_text) or upright_score <= score:
+            # Detection preferred another orientation, but reading that
+            # orientation did not actually come out any better. Say so rather
+            # than silently handing over a second transcript that is no more
+            # trustworthy than the first.
+            return (
+                "ScanBox could not read this page clearly. It looks like the "
+                f"page was scanned {orientation}, but reading it turned around "
+                "did not come out any better. Try scanning it again."
+                + "\n\n"
+            ) + text, 0
+        return (
+            f"This page was scanned {orientation}, which is why it first came "
+            f"out as nonsense. ScanBox turned it {rotation} degrees and read "
+            "it again. The corrected reading follows."
+            + "\n\n"
+        ) + upright_text, rotation
 
     def process_document(
         self, path, allow_install_prompt=True, detect_page=True, page_number=None,
@@ -8807,11 +9216,7 @@ class ScanBox(wx.Frame):
             destination = (stem if extension else destination) + ".jpg"
         with Image.open(source) as img:
             img = ImageOps.exif_transpose(img)
-            transpose = {
-                90: Image.Transpose.ROTATE_270,
-                180: Image.Transpose.ROTATE_180,
-                270: Image.Transpose.ROTATE_90,
-            }.get(rotation)
+            transpose = _ROTATION_TRANSPOSES.get(rotation)
             if transpose is not None:
                 img = img.transpose(transpose)
             img.convert("RGB").save(
@@ -8829,11 +9234,9 @@ class ScanBox(wx.Frame):
             for source in sources:
                 with Image.open(source) as img:
                     img = ImageOps.exif_transpose(img)
-                    transpose = {
-                        90: Image.Transpose.ROTATE_270,
-                        180: Image.Transpose.ROTATE_180,
-                        270: Image.Transpose.ROTATE_90,
-                    }.get(rotations.get(source, 0))
+                    transpose = _ROTATION_TRANSPOSES.get(
+                        rotations.get(source, 0)
+                    )
                     if transpose is not None:
                         img = img.transpose(transpose)
                     pages.append(img.convert("RGB"))
@@ -9089,7 +9492,7 @@ def main():
         if existing_hwnd:
             SW_RESTORE = 9
             ctypes.windll.user32.ShowWindow(existing_hwnd, SW_RESTORE)
-            ctypes.windll.user32.SetForegroundWindow(existing_hwnd)
+            bring_window_to_front(existing_hwnd)
             message = "ScanBox is already running. Switching to the existing window."
         else:
             message = (

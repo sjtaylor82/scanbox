@@ -4,6 +4,23 @@
 
 - Give every external local-AI task an 8,192-token output ceiling so reasoning
   models such as Gemma have room for a visible answer.
+- Say when a page was scanned upside down or sideways. If a document reading
+  comes out as nonsense, ScanBox now checks whether the page was upright,
+  turns it, and reads it again, explaining what it found in the Results text
+  as well as speaking it.
+- Queue screen-reader announcements and pace them apart so one announcement no
+  longer cuts off the one before it. Live FaceAlign guidance still replaces a
+  stale position immediately rather than waiting its turn.
+- Say when part of a page fell outside the scan. ScanBox asks the OCR engine
+  where it found words and reports any edge that cut through them, so a
+  reading that looks complete but has words missing no longer passes without
+  comment. A form's own full-bleed header is not mistaken for clipping, and
+  the edges are named as the reader has the page, not as it went through the
+  scanner. Reported on both scanning and Scan and Save Images.
+- Bring windows to the foreground through one guarded helper that rejects a
+  handle which is not a number, instead of handing it to ctypes. This also
+  fixes a crash that was ending the test run early and leaving ten scanner and
+  local-AI tests unrun.
 
 ## 2026.9.6
 
